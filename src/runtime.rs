@@ -159,13 +159,17 @@ impl<F: Future + 'static> TaskState<F> {
 }
 
 /// Main runtime structure.
+/// 
 /// It is stored as an implicit thread_local, so it is only used through static methods:
 /// - [`Runtime::spawn`]
 /// - [`Runtime::block_on`]
+/// 
+/// See the [`crate`] root page for examples.
 pub struct Runtime {
     ready_tasks: VecDeque<Pin<Rc<dyn TaskMakeProgress>>>,
 }
 
+// Internal stuff
 impl Runtime {
     /// Creates a new runtime. Not public as the runtime is accessed through thread_local instance.
     fn new() -> Self {
@@ -178,37 +182,78 @@ impl Runtime {
         /// Use a thread local instance for simplicity of access to the runtime.
         /// This avoid having to store Rc<Runtime> in task futures.
         /// This limits to one Runtime per thread, but only one can run a time anyway due to block_on.
-        /// TODO activate / deactivate only during block_on
-        static INSTANCE: RefCell<Runtime> = RefCell::new(Runtime::new());
+        /// Runtime is only started (Some) during [`block_on()`].
+        static INSTANCE: RefCell<Option<Runtime>> = RefCell::new(None);
     );
 
+    /// Create the runtime, run f, then destroy the runtime. Not unwind safe.
+    fn with_runtime_enabled<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        Self::INSTANCE.with(|ref_cell| match ref_cell.replace(Some(Runtime::new())) {
+            None => (),
+            Some(_) => panic!("runtime already enabled"),
+        });
+        let r = f();
+        Self::INSTANCE.with(|ref_cell| match ref_cell.replace(None) {
+            None => panic!("runtime already disabled"),
+            Some(_) => (),
+        });
+        r
+    }
+
     /// Runs `f` with mutable access to the runtime.
+    /// Requires the runtime
     fn access_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Runtime) -> R,
     {
-        Self::INSTANCE.with(move |ref_cell| f(&mut *ref_cell.borrow_mut()))
+        Self::INSTANCE.with(move |ref_cell| {
+            let mut borrow = ref_cell.borrow_mut();
+            let runtime = borrow.as_mut().expect("runtime used outside of block_on");
+            f(runtime)
+        })
     }
+}
 
+// Public API
+impl Runtime {
     /// Runs until `future` finishes, and return its value.
+    ///
+    /// Must not be called inside itself, or it will panic:
+    /// ```should_panic
+    /// use star::Runtime;
+    /// Runtime::block_on(async {
+    ///     Runtime::block_on(async {});
+    /// });
+    /// ```
     pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> {
-        let task = Self::spawn(future);
-        // Run
-        loop {
-            match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
-                None => break,
-                Some(task) => task.as_ref().make_progress(),
+        Self::with_runtime_enabled(move || {
+            let task = Self::spawn(future);
+            // Run
+            loop {
+                match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
+                    None => break,
+                    Some(task) => task.as_ref().make_progress(),
+                }
+                // TODO reactor and check root task
             }
-        }
-        // Check task has finished
-        match task.0.poll_join(None) {
-            Poll::Ready(value) => Ok(value),
-            Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-        }
+            // Check task has finished
+            match task.0.poll_join(None) {
+                Poll::Ready(value) => Ok(value),
+                Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        })
     }
 
     /// Creates a new task and return a struct representing completion.
-    /// Only used inside async block to spawn new tasks ; to launch the runtime use [`Runtime::block_on()`].
+    ///
+    /// Must be used inside a call to [`Runtime::block_on()`], or it will panic:
+    /// ```should_panic
+    /// use star::Runtime;
+    /// Runtime::spawn(async {}); // panics !
+    /// ```
     pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
         // TODO optim with boxed future if too large ?
         let task = TaskState::new(future);
