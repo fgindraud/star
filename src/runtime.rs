@@ -227,7 +227,29 @@ impl Runtime {
 ///     handle.await
 /// };
 /// ```
+///
+/// Completion can be manually tested in a non-blocking way:
+/// ```
+/// use star::Runtime;
+/// Runtime::block_on(async {
+///     let handle = Runtime::spawn(async { 42 });
+///     let test = handle.try_join();
+///     assert!(test.is_err()); // Should not have time to run
+/// }).unwrap();
+/// ```
 pub struct JoinHandle<T>(Pin<Rc<dyn TaskPollJoin<Output = T>>>);
+
+impl<T> JoinHandle<T> {
+    /// Test task completion.
+    /// If complete, return the task output, consuming the handle.
+    /// If not complete, gives back the handle.
+    pub fn try_join(self) -> Result<T, Self> {
+        match self.0.poll_join(None) {
+            Poll::Ready(value) => Ok(value),
+            Poll::Pending => Err(self),
+        }
+    }
+}
 
 impl<T> Future for JoinHandle<T> {
     type Output = T;
