@@ -6,31 +6,38 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::collections::VecDeque;
 use std::io;
-use std::rc::{Rc, Weak};
-
-#[derive(Clone)]
-pub struct RuntimeHandle(Rc<RefCell<Runtime>>);
+use std::rc::Rc;
 
 struct Runtime {
     ready_tasks: VecDeque<Pin<Rc<dyn TaskMakeProgress>>>,
 }
 
-impl RuntimeHandle {
-    /// Creates a new runtime
-    pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(Runtime {
+impl Runtime {
+    fn new() -> Self {
+        Runtime {
             ready_tasks: VecDeque::new(),
-        })))
+        }
+    }
+
+    thread_local!(
+        /// Use a thread local instance for simplicity.
+        /// TODO activate / deactivate only during block_on
+        static INSTANCE: RefCell<Runtime> = RefCell::new(Runtime::new());
+    );
+
+    fn access_mut<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut Runtime) -> R,
+    {
+        Self::INSTANCE.with(move |ref_cell| f(&mut *ref_cell.borrow_mut()))
     }
 
     /// Runs tasks until the given task finishes, and return its value
-    pub fn block_on<F: Future + 'static>(&self, future: F) -> Result<F::Output, io::Error> {
-        let task = self.spawn(future);
+    pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> {
+        let task = Self::spawn(future);
         // Run
         loop {
-            // Written this way to ensure RefCell borrow ends before make_progress()
-            let next_task = self.0.borrow_mut().ready_tasks.pop_front();
-            match next_task {
+            match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
                 None => break,
                 Some(task) => task.as_ref().make_progress(),
             }
@@ -44,9 +51,9 @@ impl RuntimeHandle {
 
     /// Creates a new task and return a struct representing completion.
     /// Only used inside async block to spawn new tasks ; to launch the runtime use block_on.
-    pub fn spawn<F: Future + 'static>(&self, future: F) -> JoinHandle<F::Output> {
-        let task = TaskState::new(future, &self.0);
-        self.0.borrow_mut().ready_tasks.push_back(task.clone());
+    pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
+        let task = TaskState::new(future);
+        Self::access_mut(|rt| rt.ready_tasks.push_back(task.clone()));
         JoinHandle(task)
     }
 }
@@ -77,19 +84,16 @@ enum TaskState<F: Future> {
         // Rc<dyn...> is a fat pointer, not convertible to *const() for RawWaker.
         // So use the shared_from_this pattern from C++ of storing a weak pointer to the concrete task frame.
         // This allows retrieving a Rc<concrete_task> which is a raw ptr for the Waker.
-        // Both pointers are Weak to prevent Rc loop leak.
-        runtime: Weak<RefCell<Runtime>>,
         self_ptr: PinWeak<RefCell<TaskState<F>>>,
     },
     Completed(Option<F::Output>),
 }
 
 impl<F: Future + 'static> TaskState<F> {
-    fn new(f: F, runtime: &Rc<RefCell<Runtime>>) -> Pin<Rc<RefCell<TaskState<F>>>> {
+    fn new(f: F) -> Pin<Rc<RefCell<TaskState<F>>>> {
         let task = Rc::pin(RefCell::new(TaskState::Running {
             future: f,
             wake_on_completion: None,
-            runtime: Rc::downgrade(runtime),
             self_ptr: PinWeak::new(),
         }));
         // Update the shared_from_this pointer to the pinned rc location
@@ -101,11 +105,7 @@ impl<F: Future + 'static> TaskState<F> {
     }
 
     fn wake(self_ptr: Pin<Rc<RefCell<Self>>>) {
-        let runtime = match &*self_ptr.borrow() {
-            TaskState::Running { runtime, .. } => runtime.upgrade().unwrap(),
-            _ => unreachable!(),
-        };
-        runtime.borrow_mut().ready_tasks.push_back(self_ptr);
+        Runtime::access_mut(|rt| rt.ready_tasks.push_back(self_ptr))
     }
 
     /// RawWaker *const() ptr is Pin<Rc<RefCell<Self>>>
@@ -213,21 +213,17 @@ impl<F: Future> TaskJoin for RefCell<TaskState<F>> {
 
 #[test]
 fn test() {
-    let runtime = RuntimeHandle::new();
-
-    assert_eq!(runtime.block_on(async { 42 }).expect("no sys error"), 42);
+    assert_eq!(Runtime::block_on(async { 42 }).expect("no sys error"), 42);
 
     assert_eq!(
-        runtime
-            .block_on({
-                let runtime = runtime.clone();
-                async move {
-                    let a = runtime.spawn(async { 21 });
-                    let b = runtime.spawn(async { 21 });
-                    a.await + b.await
-                }
-            })
-            .expect("no sys error"),
+        Runtime::block_on({
+            async {
+                let a = Runtime::spawn(async { 21 });
+                let b = Runtime::spawn(async { 21 });
+                a.await + b.await
+            }
+        })
+        .expect("no sys error"),
         42
     );
 }
