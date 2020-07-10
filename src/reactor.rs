@@ -3,7 +3,7 @@ use std::io;
 
 // use std::os::unix::io::RawFd;
 
-/// Safe wrapper around poll() syscall
+/// Safe wrapper around `poll()` syscall
 fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<usize, io::Error> {
     let return_code = unsafe {
         libc::ppoll(
