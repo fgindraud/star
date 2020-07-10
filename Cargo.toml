@@ -1,0 +1,9 @@
+[package]
+name = "star"
+version = "0.1.0"
+authors = ["François Gindraud <francois.gindraud@gmail.com>"]
+edition = "2018"
+description = "Small single thread async runtime"
+
+[dependencies]
+libc = "^0.2"
