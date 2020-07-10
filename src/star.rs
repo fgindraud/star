@@ -1,3 +1,4 @@
+use crate::utils::PinWeak;
 use core::cell::RefCell;
 use core::future::Future;
 use core::mem::ManuallyDrop;
@@ -5,9 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::collections::VecDeque;
 use std::io;
-use std::os::unix::io::RawFd;
 use std::rc::{Rc, Weak};
-use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct RuntimeHandle(Rc<RefCell<Runtime>>);
@@ -95,7 +94,7 @@ impl<F: Future + 'static> TaskState<F> {
         }));
         // Update the shared_from_this pointer to the pinned rc location
         match &mut *task.borrow_mut() {
-            TaskState::Running { self_ptr, .. } => *self_ptr = PinWeak::from(task.clone()),
+            TaskState::Running { self_ptr, .. } => *self_ptr = PinWeak::downgrade(task.clone()),
             _ => unreachable!(),
         }
         task
@@ -155,27 +154,6 @@ impl<F: Future + 'static> TaskState<F> {
     }
 }
 
-/// Weak pointer to Pin<Rc<T>>
-struct PinWeak<T>(Weak<T>);
-
-impl<T> From<Pin<Rc<T>>> for PinWeak<T> {
-    fn from(rc: Pin<Rc<T>>) -> PinWeak<T> {
-        // SAFETY : will always be restored to a Pin<Rc<T>>
-        PinWeak(Rc::downgrade(&unsafe { Pin::into_inner_unchecked(rc) }))
-    }
-}
-
-impl<T> PinWeak<T> {
-    fn new() -> PinWeak<T> {
-        PinWeak(Weak::new())
-    }
-
-    fn upgrade(&self) -> Option<Pin<Rc<T>>> {
-        // SAFETY : can only be built using a Pin<Rc<T>>
-        self.0.upgrade().map(|rc| unsafe { Pin::new_unchecked(rc) })
-    }
-}
-
 /// Internal trait for the make_progress capability.
 /// Used to get a type erased reference to the task for the runtime.
 trait TaskMakeProgress {
@@ -230,28 +208,6 @@ impl<F: Future> TaskJoin for RefCell<TaskState<F>> {
             }
             TaskState::Completed(value) => Poll::Ready(value.take().expect("Double join")),
         }
-    }
-}
-
-// Wrap poll() syscall
-fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<usize, io::Error> {
-    let return_code = unsafe {
-        libc::ppoll(
-            fds.as_mut_ptr(),
-            fds.len() as libc::nfds_t,
-            match timeout {
-                None => std::ptr::null(),
-                Some(t) => &libc::timespec {
-                    tv_sec: t.as_secs() as libc::c_long,
-                    tv_nsec: t.subsec_nanos() as libc::c_long,
-                },
-            },
-            std::ptr::null(),
-        )
-    };
-    match return_code {
-        -1 => Err(io::Error::last_os_error()),
-        n => Ok(n as usize),
     }
 }
 
