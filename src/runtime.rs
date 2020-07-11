@@ -95,11 +95,26 @@ impl<F: Future> TaskPollJoin for RefCell<TaskState<F>> {
             TaskState::Running {
                 wake_on_completion, .. // SAFETY : future is not moved
             } => {
-                *wake_on_completion = waker.cloned(); // Always update waker
+                update_waker(wake_on_completion, waker);
                 Poll::Pending
             }
             TaskState::Completed(value) => Poll::Ready(value.take().expect("try_join: value already consumed")),
         }
+    }
+}
+
+/// Replace stored waker, only if not waking the same task
+fn update_waker(stored: &mut Option<Waker>, replacement: Option<&Waker>) {
+    match replacement {
+        Some(replacement) => match stored {
+            Some(stored) => {
+                if !replacement.will_wake(stored) {
+                    *stored = replacement.clone()
+                }
+            }
+            None => *stored = Some(replacement.clone()),
+        },
+        None => *stored = None,
     }
 }
 
@@ -159,11 +174,11 @@ impl<F: Future + 'static> TaskState<F> {
 }
 
 /// Main runtime structure.
-/// 
+///
 /// It is stored as an implicit thread_local, so it is only used through static methods:
 /// - [`Runtime::spawn`]
 /// - [`Runtime::block_on`]
-/// 
+///
 /// See the [`crate`] root page for examples.
 pub struct Runtime {
     ready_tasks: VecDeque<Pin<Rc<dyn TaskMakeProgress>>>,
