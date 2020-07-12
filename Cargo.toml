@@ -7,3 +7,4 @@ description = "Small single thread async runtime"
 
 [dependencies]
 libc = "^0.2"
+bitflags = "^1" # FdEvent

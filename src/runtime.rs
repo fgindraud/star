@@ -1,3 +1,4 @@
+use crate::reactor::{Event, Reactor};
 use crate::utils::PinWeak;
 use core::cell::RefCell;
 use core::future::Future;
@@ -182,6 +183,7 @@ impl<F: Future + 'static> TaskState<F> {
 /// See the [`crate`] root page for examples.
 pub struct Runtime {
     ready_tasks: VecDeque<Pin<Rc<dyn TaskMakeProgress>>>,
+    reactor: Reactor,
 }
 
 // Internal stuff
@@ -190,6 +192,7 @@ impl Runtime {
     fn new() -> Self {
         Runtime {
             ready_tasks: VecDeque::new(),
+            reactor: Reactor::new(),
         }
     }
 
@@ -232,7 +235,7 @@ impl Runtime {
     }
 }
 
-// Public API
+// Main public API
 impl Runtime {
     /// Runs until `future` finishes, and return its value.
     ///
@@ -240,7 +243,7 @@ impl Runtime {
     /// ```should_panic
     /// use star::Runtime;
     /// Runtime::block_on(async {
-    ///     Runtime::block_on(async {});
+    ///     Runtime::block_on(async {}); // panics !
     /// });
     /// ```
     pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> {
@@ -315,5 +318,17 @@ impl<T> Future for JoinHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<T> {
         self.0.poll_join(Some(context.waker()))
+    }
+}
+
+impl Runtime {
+    /// Register a [`Waker`] to be waken if the given [`Event`] occurs.
+    /// This is mainly used in basic IO / time related [`Future`] implementations.
+    /// When a future must wait on a event, it calls this method with it, and returns `Poll::Pending`.
+    /// This ensures the task will be rescheduled when the event occurs.
+    /// 
+    /// This panics if not run inside [`Runtime::block_on()`].
+    pub fn wake_on_event(event: Event, waker: Waker) {
+        Self::access_mut(|rt| rt.reactor.register(event, waker))
     }
 }

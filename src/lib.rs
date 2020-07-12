@@ -36,4 +36,10 @@ mod reactor;
 /// Executor, task definition, overall Runtime
 mod runtime;
 
+// TODO timer (with cfg flag)
+// TODO file IO (with cfg flag)
+
+// Main API entry point
 pub use runtime::{JoinHandle, Runtime};
+// Exported to allow external future implementations to talk to the reactor (which is private).
+pub use reactor::{Event, FdEvent};
