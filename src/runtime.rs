@@ -11,9 +11,8 @@ use std::rc::Rc;
 
 /// Task frame ; holds the future then the future's result.
 /// This is allocated once in an Rc<PinCell<Self>>, and two handles are generated from it:
-/// - one `Rc<dyn TaskMakeProgress>` for runtime queues
-/// - one `Rc<dyn TaskPollJoin<F::Output>>` for the `JoinHandle<F::Output>`
-/// Handles do not include the PinCell as coercion
+/// - one `Rc<PinCell<dyn TaskMakeProgress>>` for runtime queues
+/// - one `Rc<PinCell<dyn TaskPollJoin<F::Output>>>` for the `JoinHandle<F::Output>`
 enum TaskState<F: Future> {
     Running {
         future: F,
@@ -32,7 +31,7 @@ enum TaskState<F: Future> {
     Completed(Option<F::Output>),
 }
 
-/// Pin projected version of TaskState
+/// Pin projected version of TaskState.
 enum TaskStateProj<'a, F: Future> {
     Running {
         future: Pin<&'a mut F>, // Structural
@@ -45,8 +44,7 @@ enum TaskStateProj<'a, F: Future> {
 
 impl<F: Future> TaskState<F> {
     /// Pinning projection of TaskState.
-    /// Preserves the pinning state of fields which are structural.
-    /// Removes pinning state of those which are not.
+    /// Propagate pinning to the future only.
     fn project<'a>(self: Pin<&'a mut Self>) -> TaskStateProj<'a, F> {
         // SAFETY: only the future is structural
         unsafe {
@@ -87,13 +85,12 @@ impl<F: Future> TaskState<F> {
 /// Internal trait: advance a task state with type erasure.
 trait TaskMakeProgress {
     /// Requires Pinned Self to propagate Pin reference to the Future.
-    fn make_progress(self: Pin<&Self>);
+    fn make_progress(self: Pin<&mut Self>);
 }
 
-impl<F: Future + 'static> TaskMakeProgress for PinCell<TaskState<F>> {
-    fn make_progress(self: Pin<&Self>) {
-        let mut task_state = self.borrow_mut();
-        match task_state.as_mut().project() {
+impl<F: Future + 'static> TaskMakeProgress for TaskState<F> {
+    fn make_progress(mut self: Pin<&mut Self>) {
+        match self.as_mut().project() {
             TaskStateProj::Completed(_) => panic!("make_progress on completed task"),
             TaskStateProj::Running {
                 future,
@@ -109,8 +106,7 @@ impl<F: Future + 'static> TaskMakeProgress for PinCell<TaskState<F>> {
                         if let Some(waker) = wake_on_completion.take() {
                             waker.wake()
                         }
-                        // SAFETY : future is destroyed there
-                        task_state.as_mut().set(TaskState::Completed(Some(value)))
+                        self.set(TaskState::Completed(Some(value)))
                     }
                 }
             }
@@ -120,17 +116,16 @@ impl<F: Future + 'static> TaskMakeProgress for PinCell<TaskState<F>> {
 
 /// Internal trait: test task completion and return output value with type erasure.
 trait TaskPollJoin {
-    /// Return type of the task future
     type Output;
 
     /// Waker is optional: present for async wait, absent for blocking wait.
-    fn poll_join(self: Pin<&Self>, waker: Option<&Waker>) -> Poll<Self::Output>;
+    fn poll_join(self: Pin<&mut Self>, waker: Option<&Waker>) -> Poll<Self::Output>;
 }
 
-impl<F: Future> TaskPollJoin for PinCell<TaskState<F>> {
+impl<F: Future> TaskPollJoin for TaskState<F> {
     type Output = F::Output;
-    fn poll_join(self: Pin<&Self>, waker: Option<&Waker>) -> Poll<F::Output> {
-        match self.borrow_mut().as_mut().project() {
+    fn poll_join(self: Pin<&mut Self>, waker: Option<&Waker>) -> Poll<F::Output> {
+        match self.project() {
             TaskStateProj::Running {
                 wake_on_completion, ..
             } => {
@@ -217,7 +212,7 @@ impl<F: Future + 'static> TaskState<F> {
 ///
 /// See the [`crate`] root page for examples.
 pub struct Runtime {
-    ready_tasks: VecDeque<Pin<Rc<dyn TaskMakeProgress>>>,
+    ready_tasks: VecDeque<Pin<Rc<PinCell<dyn TaskMakeProgress>>>>,
     reactor: Reactor,
 }
 
@@ -302,12 +297,13 @@ impl Runtime {
             loop {
                 match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
                     None => break,
-                    Some(task) => task.as_ref().make_progress(),
+                    Some(task) => task.as_ref().borrow_mut().as_mut().make_progress(),
                 }
                 // TODO reactor and check root task
             }
             // Check task has finished
-            match Pin::as_ref(&task.0).poll_join(None) {
+            let poll = task.0.as_ref().borrow_mut().as_mut().poll_join(None);
+            match poll {
                 Poll::Ready(value) => Ok(value),
                 Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
@@ -349,14 +345,15 @@ impl Runtime {
 ///     assert!(test.is_err()); // Should not have time to run
 /// }).unwrap();
 /// ```
-pub struct JoinHandle<T>(Pin<Rc<dyn TaskPollJoin<Output = T>>>);
+pub struct JoinHandle<T>(Pin<Rc<PinCell<dyn TaskPollJoin<Output = T>>>>);
 
 impl<T> JoinHandle<T> {
     /// Test task completion.
     /// If complete, return the task output, consuming the handle.
     /// If not complete, gives back the handle.
     pub fn try_join(self) -> Result<T, Self> {
-        match self.0.as_ref().poll_join(None) {
+        let poll = self.0.as_ref().borrow_mut().as_mut().poll_join(None);
+        match poll {
             Poll::Ready(value) => Ok(value),
             Poll::Pending => Err(self),
         }
@@ -366,7 +363,11 @@ impl<T> JoinHandle<T> {
 impl<T> Future for JoinHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<T> {
-        self.0.as_ref().poll_join(Some(context.waker()))
+        self.0
+            .as_ref()
+            .borrow_mut()
+            .as_mut()
+            .poll_join(Some(context.waker()))
     }
 }
 
