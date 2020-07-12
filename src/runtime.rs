@@ -25,6 +25,9 @@ enum TaskState<F: Future> {
         /// `Rc<dyn TaskMakeProgress>` is a fat pointer, not convertible to *const() for RawWaker.
         /// Using this self_ptr, we can recreate the Rc to the concrete Task and then generate the Rc<dyn TaskMakeProgress>.
         self_ptr: PinWeak<RefCell<TaskState<F>>>,
+        /// Indicates if the task is already scheduled.
+        /// This is used in [`Runtime::schedule_task`] to prevent multiple references in the `ready_queue`.
+        in_ready_queue: bool,
     },
     Completed(Option<F::Output>),
 }
@@ -36,6 +39,7 @@ impl<F: Future + 'static> TaskState<F> {
             future: f,
             wake_on_completion: None,
             self_ptr: PinWeak::new(),
+            in_ready_queue: false,
         }));
         // Update the shared_from_this pointer to the pinned rc location
         match &mut *task.borrow_mut() {
@@ -61,7 +65,10 @@ impl<F: Future + 'static> TaskMakeProgress for RefCell<TaskState<F>> {
                 future,
                 wake_on_completion,
                 self_ptr,
+                in_ready_queue,
             } => {
+                // Not in ready queue anymore
+                *in_ready_queue = false;
                 // SAFETY : The future is not moved out until destruction when completed
                 let future = unsafe { Pin::new_unchecked(future) };
                 let self_waker = TaskState::make_waker(self_ptr);
@@ -94,12 +101,14 @@ impl<F: Future> TaskPollJoin for RefCell<TaskState<F>> {
     fn poll_join(&self, waker: Option<&Waker>) -> Poll<F::Output> {
         match &mut *self.borrow_mut() {
             TaskState::Running {
-                wake_on_completion, .. // SAFETY : future is not moved
+                wake_on_completion, ..
             } => {
                 update_waker(wake_on_completion, waker);
                 Poll::Pending
             }
-            TaskState::Completed(value) => Poll::Ready(value.take().expect("try_join: value already consumed")),
+            TaskState::Completed(value) => {
+                Poll::Ready(value.take().expect("try_join: value already consumed"))
+            }
         }
     }
 }
@@ -121,11 +130,6 @@ fn update_waker(stored: &mut Option<Waker>, replacement: Option<&Waker>) {
 
 // Waker for task
 impl<F: Future + 'static> TaskState<F> {
-    /// Wake self, by rescheduling in the runtime using self_ptr.
-    fn wake(self_ptr: Pin<Rc<RefCell<Self>>>) {
-        Runtime::access_mut(|rt| rt.ready_tasks.push_back(self_ptr))
-    }
-
     /// Make waker from self_ptr.
     /// The [`RawWaker`] `* const()` ptr is `Pin<Rc<RefCell<Self>>>`.
     /// RawWaker thus has ownership of the task as one Rc handle.
@@ -157,14 +161,14 @@ impl<F: Future + 'static> TaskState<F> {
 
     unsafe fn rawwaker_wake(ptr: *const ()) {
         let self_ptr = Pin::new_unchecked(Rc::from_raw(ptr as *const RefCell<Self>));
-        Self::wake(self_ptr)
+        Runtime::schedule_task(self_ptr)
     }
 
     unsafe fn rawwaker_wake_by_ref(ptr: *const ()) {
         let self_ptr = ManuallyDrop::new(Pin::new_unchecked(Rc::from_raw(
             ptr as *const RefCell<Self>,
         )));
-        Self::wake(Pin::clone(&self_ptr))
+        Runtime::schedule_task(Pin::clone(&self_ptr))
     }
 
     unsafe fn rawwaker_drop(ptr: *const ()) {
@@ -221,8 +225,7 @@ impl Runtime {
         r
     }
 
-    /// Runs `f` with mutable access to the runtime.
-    /// Requires the runtime
+    /// Runs `f` with mutable access to the runtime. Panics if runtime is disabled.
     fn access_mut<F, R>(f: F) -> R
     where
         F: FnOnce(&mut Runtime) -> R,
@@ -232,6 +235,17 @@ impl Runtime {
             let runtime = borrow.as_mut().expect("runtime used outside of block_on");
             f(runtime)
         })
+    }
+
+    /// Put a task in the `ready_queue` if it is not already there.
+    fn schedule_task<F: Future + 'static>(task: Pin<Rc<RefCell<TaskState<F>>>>) {
+        let already_in_ready_queue = match &mut *task.borrow_mut() {
+            TaskState::Running { in_ready_queue, .. } => std::mem::replace(in_ready_queue, true),
+            TaskState::Completed(_) => true, // A completed task should not be scheduled
+        };
+        if !already_in_ready_queue {
+            Self::access_mut(|rt| rt.ready_tasks.push_back(task))
+        }
     }
 }
 
@@ -275,7 +289,7 @@ impl Runtime {
     pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
         // TODO optim with boxed future if too large ?
         let task = TaskState::new(future);
-        Self::access_mut(|rt| rt.ready_tasks.push_back(task.clone()));
+        Self::schedule_task(task.clone());
         JoinHandle(task)
     }
 }
@@ -326,7 +340,7 @@ impl Runtime {
     /// This is mainly used in basic IO / time related [`Future`] implementations.
     /// When a future must wait on a event, it calls this method with it, and returns `Poll::Pending`.
     /// This ensures the task will be rescheduled when the event occurs.
-    /// 
+    ///
     /// This panics if not run inside [`Runtime::block_on()`].
     pub fn wake_on_event(event: Event, waker: Waker) {
         Self::access_mut(|rt| rt.reactor.register(event, waker))
