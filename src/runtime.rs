@@ -160,7 +160,10 @@ impl<F: Future> TaskPollJoin for TaskState<F> {
             TaskStateProj::Running {
                 wake_on_completion, ..
             } => {
-                update_waker(wake_on_completion, waker);
+                match (wake_on_completion, waker) {
+                    (Some(old), Some(new)) if old.will_wake(new) => (),
+                    (old, new) => *old = new.cloned(),
+                }
                 Poll::Pending
             }
             TaskStateProj::Completed(value) => {
@@ -170,27 +173,15 @@ impl<F: Future> TaskPollJoin for TaskState<F> {
     }
 }
 
-/// Replace stored waker, only if not waking the same task
-fn update_waker(stored: &mut Option<Waker>, replacement: Option<&Waker>) {
-    match replacement {
-        Some(replacement) => match stored {
-            Some(stored) => {
-                if !replacement.will_wake(stored) {
-                    *stored = replacement.clone()
-                }
-            }
-            None => *stored = Some(replacement.clone()),
-        },
-        None => *stored = None,
-    }
-}
-
 // Waker for task
 impl<F: Future + 'static> TaskFrame<TaskState<F>> {
     /// Make waker from self_ptr.
     /// The [`RawWaker`] `* const()` ptr is `Pin<Rc<PinCell<Self>>>`: it has ownership of the task.
     fn make_waker(self_ptr: &PinWeak<PinCell<Self>>) -> Waker {
         let self_ptr = self_ptr.upgrade().unwrap();
+        // SAFETY: Implementation should be ok, except for being !Send & !Sync.
+        // A warning of this has been put on the main page.
+        // FIXME way to detect violations ?
         unsafe { Waker::from_raw(Self::into_rawwaker(self_ptr)) }
     }
 

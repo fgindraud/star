@@ -11,6 +11,7 @@ pub struct Reactor {
 }
 
 /// [`Reactor`] supported event types.
+#[derive(Debug, Clone)]
 pub enum Event {
     /// Wake when `fd` has any event type in `event`. Used for IO.
     Fd { fd: RawFd, event: FdEvent },
