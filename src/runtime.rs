@@ -241,7 +241,7 @@ pub struct Runtime {
     reactor: Reactor,
 }
 
-// Internal stuff
+/// Internal stuff
 impl Runtime {
     /// Creates a new runtime. Not public as the runtime is accessed through thread_local instance.
     fn new() -> Self {
@@ -320,7 +320,7 @@ impl Runtime {
     }
 }
 
-// Main public API
+/// Main public API
 impl Runtime {
     /// Runs until `future` finishes, and return its value.
     ///
@@ -343,13 +343,14 @@ impl Runtime {
                 }
 
                 if more_tasks {
-                    continue;
-                }
-
-                let waken = Self::access_mut(|rt| rt.reactor.wait())?;
-                if waken == 0 {
-                    // No more task to run, and no task awoke from a wait : stalled
-                    break Err(io::Error::new(io::ErrorKind::Other, "Runtime has stalled"));
+                    // Check for events to balance computation VS event driven tasks
+                    Self::access_mut(|rt| rt.reactor.poll())?;
+                } else {
+                    let waken = Self::access_mut(|rt| rt.reactor.wait())?;
+                    if waken == 0 {
+                        // No more task to run, and no task awoke from a wait : stalled
+                        break Err(io::Error::new(io::ErrorKind::Other, "Runtime has stalled"));
+                    }
                 }
             }
         })
@@ -367,6 +368,16 @@ impl Runtime {
         let task = TaskFrame::new(future);
         Self::schedule_task(task.clone());
         JoinHandle(task)
+    }
+
+    /// Register a [`Waker`] to be waken if the given [`Event`] occurs.
+    /// This is mainly used in basic IO / time related [`Future`] implementations.
+    /// When a future must wait on a event, it calls this method with it, and returns `Poll::Pending`.
+    /// This ensures the task will be rescheduled when the event occurs.
+    ///
+    /// This panics if not run inside [`Runtime::block_on()`].
+    pub fn wake_on_event(event: Event, waker: Waker) {
+        Self::access_mut(|rt| rt.reactor.register(event, waker))
     }
 }
 
@@ -419,17 +430,5 @@ impl<T> Future for JoinHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<T> {
         self.poll_join(Some(context.waker()))
-    }
-}
-
-impl Runtime {
-    /// Register a [`Waker`] to be waken if the given [`Event`] occurs.
-    /// This is mainly used in basic IO / time related [`Future`] implementations.
-    /// When a future must wait on a event, it calls this method with it, and returns `Poll::Pending`.
-    /// This ensures the task will be rescheduled when the event occurs.
-    ///
-    /// This panics if not run inside [`Runtime::block_on()`].
-    pub fn wake_on_event(event: Event, waker: Waker) {
-        Self::access_mut(|rt| rt.reactor.register(event, waker))
     }
 }
