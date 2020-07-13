@@ -51,7 +51,10 @@ impl Reactor {
         unimplemented!()
     }
 
-    pub fn wait(&mut self) -> Result<(), io::Error> {
+    /// Blocking wait for events.
+    /// Returns the number of waken [`Waker`].
+    pub fn wait(&mut self) -> Result<usize, io::Error> {
+        // In case of interruption, retry
         unimplemented!()
     }
 }

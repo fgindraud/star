@@ -205,8 +205,8 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
         Pin::new_unchecked(Rc::from_raw(ptr as *const PinCell<Self>))
     }
     unsafe fn reconstruct_cloned(ptr: *const ()) -> Pin<Rc<PinCell<Self>>> {
-        let not_owned = ManuallyDrop::new(Self::reconstruct_owned(ptr));
-        Pin::clone(&not_owned)
+        let referenced = ManuallyDrop::new(Self::reconstruct_owned(ptr));
+        Pin::clone(&referenced)
     }
 
     const RAWWAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -301,6 +301,23 @@ impl Runtime {
             Self::access_mut(|rt| rt.ready_tasks.push_back(task))
         }
     }
+
+    /// Runs the next `n` tasks in the ready queue.
+    /// Returns false if we stopped due to an empty queue.
+    fn run_ready_task_batch(n: usize) -> bool {
+        for _ in 0..n {
+            match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
+                Some(task) => {
+                    let mut borrow = task.as_ref().borrow_mut();
+                    let task_frame = borrow.as_mut().proj();
+                    *task_frame.in_ready_queue = false;
+                    task_frame.state.make_progress();
+                }
+                None => return false,
+            }
+        }
+        true
+    }
 }
 
 // Main public API
@@ -317,23 +334,23 @@ impl Runtime {
     pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> {
         Self::with_runtime_enabled(move || {
             let root_task = Self::spawn(future);
-            // Run
             loop {
-                match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
-                    None => break,
-                    Some(task) => {
-                        let mut borrow = task.as_ref().borrow_mut();
-                        let task_frame = borrow.as_mut().proj();
-                        *task_frame.in_ready_queue = false;
-                        task_frame.state.make_progress()
-                    }
+                const BATCH_SIZE: usize = 16;
+                let more_tasks = Self::run_ready_task_batch(BATCH_SIZE);
+
+                if let Poll::Ready(value) = root_task.poll_join(None) {
+                    break Ok(value);
                 }
-                // TODO reactor and check root task
-            }
-            // Check task has finished
-            match root_task.poll_join(None) {
-                Poll::Ready(value) => Ok(value),
-                Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+
+                if more_tasks {
+                    continue;
+                }
+
+                let waken = Self::access_mut(|rt| rt.reactor.wait())?;
+                if waken == 0 {
+                    // No more task to run, and no task awoke from a wait : stalled
+                    break Err(io::Error::new(io::ErrorKind::Other, "Runtime has stalled"));
+                }
             }
         })
     }
