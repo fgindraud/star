@@ -9,72 +9,105 @@ use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 
-/// Task frame ; holds the future then the future's result.
-/// This is allocated once in an Rc<PinCell<Self>>, and two handles are generated from it:
-/// - one `Rc<PinCell<dyn TaskMakeProgress>>` for runtime queues
-/// - one `Rc<PinCell<dyn TaskPollJoin<F::Output>>>` for the `JoinHandle<F::Output>`
+/// Task frame. Holds the future (or future's result), and metadata.
+///
+/// This is allocated once as `Rc<PinCell<TaskFrame<TaskState<F>>>`, and two type erased handles are generated from it:
+/// - one `Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>` for runtime queues
+/// - one `Rc<PinCell<TaskFrame<dyn TaskPollJoin<F::Output>>>>` for the `JoinHandle<F::Output>`
+///
+/// Metadata directly in this struct (not `state`) can be accessed from type erased handles, reducing template use.
+struct TaskFrame<S: ?Sized> {
+    /// Indicates if the task is already scheduled.
+    /// This is used in [`Runtime::schedule_task`] to prevent multiple references in the `ready_queue`.
+    in_ready_queue: bool,
+    /// [`TaskState`] or type erased versions of it: [`TaskMakeProgress`], [`TaskPollJoin`].
+    state: S,
+}
+
+/// Holds the future then the future's result.
 enum TaskState<F: Future> {
     Running {
-        future: F,
         /// [`Waker`] of the task blocked on our [`JoinHandle`].
         wake_on_completion: Option<Waker>,
-        /// `C++`-like `shared_from_this` weak pointer to self.
-        /// This is used to build the task [`Waker`].
-        /// Re-scheduling the task with the waker requires a `Rc<dyn TaskMakeProgress>`.
-        /// `Rc<dyn TaskMakeProgress>` is a fat pointer, not convertible to *const() for RawWaker.
-        /// Using this self_ptr, we can recreate the Rc to the concrete Task and then generate the Rc<dyn TaskMakeProgress>.
-        self_ptr: PinWeak<PinCell<TaskState<F>>>,
-        /// Indicates if the task is already scheduled.
-        /// This is used in [`Runtime::schedule_task`] to prevent multiple references in the `ready_queue`.
-        in_ready_queue: bool,
+        /// Pointer to concrete self, used to create a [`Waker`].
+        ///
+        /// The executor (ready_queue) manipulates `Rc<.. dyn ..>` which are fat pointers.
+        /// RawWaker can only store a single pointer, so it cannot fit these.
+        ///
+        /// Thus the [`Waker`] object of a task is semantically a `Pin<Rc<PinCell<TaskFrame<Self>>>>`.
+        /// It cannot be generated from the executor `Rc<.. dyn ..>`.
+        /// The solution is to store a copy of the concrete pointer ([`PinWeak`] to avoid Rc loop) inside the task,
+        /// and to use this concrete pointer in to generate the [`Waker`] instance.
+        self_ptr: PinWeak<PinCell<TaskFrame<Self>>>,
+        future: F,
     },
     Completed(Option<F::Output>),
+}
+
+/// Pin projected version of TaskFrame.
+struct TaskFrameProj<'a, S: ?Sized> {
+    in_ready_queue: &'a mut bool,
+    state: Pin<&'a mut S>,
+}
+
+impl<S: ?Sized> TaskFrame<S> {
+    /// Pinning projection of TaskState.
+    fn proj<'a>(self: Pin<&'a mut Self>) -> TaskFrameProj<'a, S> {
+        // SAFETY: only state is structural
+        unsafe {
+            let ref_mut = Pin::get_unchecked_mut(self);
+            TaskFrameProj {
+                in_ready_queue: &mut ref_mut.in_ready_queue,
+                state: Pin::new_unchecked(&mut ref_mut.state),
+            }
+        }
+    }
 }
 
 /// Pin projected version of TaskState.
 enum TaskStateProj<'a, F: Future> {
     Running {
-        future: Pin<&'a mut F>, // Structural
         wake_on_completion: &'a mut Option<Waker>,
-        self_ptr: &'a mut PinWeak<PinCell<TaskState<F>>>,
-        in_ready_queue: &'a mut bool,
+        self_ptr: &'a mut PinWeak<PinCell<TaskFrame<TaskState<F>>>>,
+        future: Pin<&'a mut F>, // Structural
     },
     Completed(&'a mut Option<F::Output>),
 }
 
 impl<F: Future> TaskState<F> {
     /// Pinning projection of TaskState.
-    /// Propagate pinning to the future only.
-    fn project<'a>(self: Pin<&'a mut Self>) -> TaskStateProj<'a, F> {
+    fn proj<'a>(self: Pin<&'a mut Self>) -> TaskStateProj<'a, F> {
         // SAFETY: only the future is structural
         unsafe {
             match Pin::get_unchecked_mut(self) {
                 TaskState::Running {
+                    wake_on_completion,
+                    self_ptr,
                     future,
-                    wake_on_completion,
-                    self_ptr,
-                    in_ready_queue,
                 } => TaskStateProj::Running {
-                    future: Pin::new_unchecked(future),
                     wake_on_completion,
                     self_ptr,
-                    in_ready_queue,
+                    future: Pin::new_unchecked(future),
                 },
                 TaskState::Completed(inner) => TaskStateProj::Completed(inner),
             }
         }
     }
+}
 
-    /// Creates a new task on the heap, setting up the Weak self_ptr
-    fn new(f: F) -> Pin<Rc<PinCell<TaskState<F>>>> {
-        let task = Rc::pin(PinCell::new(TaskState::Running {
-            future: f,
-            wake_on_completion: None,
-            self_ptr: PinWeak::new(),
+impl<F: Future> TaskFrame<TaskState<F>> {
+    /// Creates a new task on the heap
+    fn new(f: F) -> Pin<Rc<PinCell<TaskFrame<TaskState<F>>>>> {
+        let task = Rc::pin(PinCell::new(TaskFrame {
             in_ready_queue: false,
+            state: TaskState::Running {
+                wake_on_completion: None,
+                self_ptr: PinWeak::new(), // Placeholder
+                future: f,
+            },
         }));
-        // Update the shared_from_this pointer to the pinned rc location
-        match task.as_ref().borrow_mut().as_mut().project() {
+        // Update placeholder
+        match task.as_ref().borrow_mut().as_mut().proj().state.proj() {
             TaskStateProj::Running { self_ptr, .. } => *self_ptr = PinWeak::downgrade(task.clone()),
             _ => unreachable!(),
         }
@@ -82,7 +115,7 @@ impl<F: Future> TaskState<F> {
     }
 }
 
-/// Internal trait: advance a task state with type erasure.
+/// Internal trait: advance a task state. For type erasure.
 trait TaskMakeProgress {
     /// Requires Pinned Self to propagate Pin reference to the Future.
     fn make_progress(self: Pin<&mut Self>);
@@ -90,17 +123,15 @@ trait TaskMakeProgress {
 
 impl<F: Future + 'static> TaskMakeProgress for TaskState<F> {
     fn make_progress(mut self: Pin<&mut Self>) {
-        match self.as_mut().project() {
+        match self.as_mut().proj() {
             TaskStateProj::Completed(_) => panic!("make_progress on completed task"),
             TaskStateProj::Running {
-                future,
                 wake_on_completion,
                 self_ptr,
-                in_ready_queue,
+                future,
             } => {
-                *in_ready_queue = false; // Not in ready queue anymore
-                let self_waker = TaskState::make_waker(self_ptr);
-                match future.poll(&mut Context::from_waker(&self_waker)) {
+                let waker = TaskFrame::make_waker(self_ptr);
+                match future.poll(&mut Context::from_waker(&waker)) {
                     Poll::Pending => (),
                     Poll::Ready(value) => {
                         if let Some(waker) = wake_on_completion.take() {
@@ -114,7 +145,7 @@ impl<F: Future + 'static> TaskMakeProgress for TaskState<F> {
     }
 }
 
-/// Internal trait: test task completion and return output value with type erasure.
+/// Internal trait: test task completion and return output value. For type erasure.
 trait TaskPollJoin {
     type Output;
 
@@ -125,7 +156,7 @@ trait TaskPollJoin {
 impl<F: Future> TaskPollJoin for TaskState<F> {
     type Output = F::Output;
     fn poll_join(self: Pin<&mut Self>, waker: Option<&Waker>) -> Poll<F::Output> {
-        match self.project() {
+        match self.proj() {
             TaskStateProj::Running {
                 wake_on_completion, ..
             } => {
@@ -133,7 +164,7 @@ impl<F: Future> TaskPollJoin for TaskState<F> {
                 Poll::Pending
             }
             TaskStateProj::Completed(value) => {
-                Poll::Ready(value.take().expect("try_join: value already consumed"))
+                Poll::Ready(value.take().expect("poll_join: value already consumed"))
             }
         }
     }
@@ -155,18 +186,27 @@ fn update_waker(stored: &mut Option<Waker>, replacement: Option<&Waker>) {
 }
 
 // Waker for task
-impl<F: Future + 'static> TaskState<F> {
+impl<F: Future + 'static> TaskFrame<TaskState<F>> {
     /// Make waker from self_ptr.
-    /// The [`RawWaker`] `* const()` ptr is `Pin<Rc<RefCell<Self>>>`.
-    /// RawWaker thus has ownership of the task as one Rc handle.
+    /// The [`RawWaker`] `* const()` ptr is `Pin<Rc<PinCell<Self>>>`: it has ownership of the task.
     fn make_waker(self_ptr: &PinWeak<PinCell<Self>>) -> Waker {
         let self_ptr = self_ptr.upgrade().unwrap();
-        unsafe {
-            Waker::from_raw(RawWaker::new(
-                Rc::into_raw(Pin::into_inner_unchecked(self_ptr)) as *const (),
-                &Self::RAWWAKER_VTABLE,
-            ))
-        }
+        unsafe { Waker::from_raw(Self::into_rawwaker(self_ptr)) }
+    }
+
+    // Conversion utils
+    unsafe fn into_rawwaker(rc: Pin<Rc<PinCell<Self>>>) -> RawWaker {
+        RawWaker::new(
+            Rc::into_raw(Pin::into_inner_unchecked(rc)) as *const (),
+            &Self::RAWWAKER_VTABLE,
+        )
+    }
+    unsafe fn reconstruct_owned(ptr: *const ()) -> Pin<Rc<PinCell<Self>>> {
+        Pin::new_unchecked(Rc::from_raw(ptr as *const PinCell<Self>))
+    }
+    unsafe fn reconstruct_cloned(ptr: *const ()) -> Pin<Rc<PinCell<Self>>> {
+        let not_owned = ManuallyDrop::new(Self::reconstruct_owned(ptr));
+        Pin::clone(&not_owned)
     }
 
     const RAWWAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -176,31 +216,16 @@ impl<F: Future + 'static> TaskState<F> {
         Self::rawwaker_drop,
     );
     unsafe fn rawwaker_clone(ptr: *const ()) -> RawWaker {
-        let self_ptr = ManuallyDrop::new(Pin::new_unchecked(Rc::from_raw(
-            ptr as *const PinCell<Self>,
-        )));
-        RawWaker::new(
-            Rc::into_raw(Pin::into_inner_unchecked(Pin::clone(&self_ptr))) as *const (),
-            &Self::RAWWAKER_VTABLE,
-        )
+        Self::into_rawwaker(Self::reconstruct_cloned(ptr))
     }
-
     unsafe fn rawwaker_wake(ptr: *const ()) {
-        let self_ptr = Pin::new_unchecked(Rc::from_raw(ptr as *const PinCell<Self>));
-        Runtime::schedule_task(self_ptr)
+        Runtime::schedule_task(Self::reconstruct_owned(ptr))
     }
-
     unsafe fn rawwaker_wake_by_ref(ptr: *const ()) {
-        let self_ptr = ManuallyDrop::new(Pin::new_unchecked(Rc::from_raw(
-            ptr as *const PinCell<Self>,
-        )));
-        Runtime::schedule_task(Pin::clone(&self_ptr))
+        Runtime::schedule_task(Self::reconstruct_cloned(ptr))
     }
-
     unsafe fn rawwaker_drop(ptr: *const ()) {
-        drop(Pin::new_unchecked(Rc::from_raw(
-            ptr as *const PinCell<Self>,
-        )))
+        drop(Self::reconstruct_owned(ptr))
     }
 }
 
@@ -212,7 +237,7 @@ impl<F: Future + 'static> TaskState<F> {
 ///
 /// See the [`crate`] root page for examples.
 pub struct Runtime {
-    ready_tasks: VecDeque<Pin<Rc<PinCell<dyn TaskMakeProgress>>>>,
+    ready_tasks: VecDeque<Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>>,
     reactor: Reactor,
 }
 
@@ -264,14 +289,13 @@ impl Runtime {
     }
 
     /// Put a task in the `ready_queue` if it is not already there.
-    fn schedule_task<F: Future + 'static>(task: Pin<Rc<PinCell<TaskState<F>>>>) {
-        let already_in_ready_queue = match task.as_ref().borrow_mut().as_mut().project() {
-            TaskStateProj::Running { in_ready_queue, .. } => {
-                let old = *in_ready_queue;
-                *in_ready_queue = true;
-                old
-            }
-            TaskStateProj::Completed(_) => true, // A completed task should not be scheduled
+    fn schedule_task(task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>) {
+        let already_in_ready_queue = {
+            let mut borrow = task.as_ref().borrow_mut();
+            let TaskFrameProj { in_ready_queue, .. } = borrow.as_mut().proj();
+            let already_in_ready_queue = *in_ready_queue;
+            *in_ready_queue = true;
+            already_in_ready_queue
         };
         if !already_in_ready_queue {
             Self::access_mut(|rt| rt.ready_tasks.push_back(task))
@@ -292,18 +316,22 @@ impl Runtime {
     /// ```
     pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> {
         Self::with_runtime_enabled(move || {
-            let task = Self::spawn(future);
+            let root_task = Self::spawn(future);
             // Run
             loop {
                 match Self::access_mut(|rt| rt.ready_tasks.pop_front()) {
                     None => break,
-                    Some(task) => task.as_ref().borrow_mut().as_mut().make_progress(),
+                    Some(task) => {
+                        let mut borrow = task.as_ref().borrow_mut();
+                        let task_frame = borrow.as_mut().proj();
+                        *task_frame.in_ready_queue = false;
+                        task_frame.state.make_progress()
+                    }
                 }
                 // TODO reactor and check root task
             }
             // Check task has finished
-            let poll = task.0.as_ref().borrow_mut().as_mut().poll_join(None);
-            match poll {
+            match root_task.poll_join(None) {
                 Poll::Ready(value) => Ok(value),
                 Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
@@ -319,7 +347,7 @@ impl Runtime {
     /// ```
     pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
         // TODO optim with boxed future if too large ?
-        let task = TaskState::new(future);
+        let task = TaskFrame::new(future);
         Self::schedule_task(task.clone());
         JoinHandle(task)
     }
@@ -345,15 +373,25 @@ impl Runtime {
 ///     assert!(test.is_err()); // Should not have time to run
 /// }).unwrap();
 /// ```
-pub struct JoinHandle<T>(Pin<Rc<PinCell<dyn TaskPollJoin<Output = T>>>>);
+pub struct JoinHandle<T>(Pin<Rc<PinCell<TaskFrame<dyn TaskPollJoin<Output = T>>>>>);
 
 impl<T> JoinHandle<T> {
+    /// Internal helper, just forward to [`TaskPollJoin::poll_join`] buried deep in the struct.
+    fn poll_join(&self, waker: Option<&Waker>) -> Poll<T> {
+        self.0
+            .as_ref()
+            .borrow_mut()
+            .as_mut()
+            .proj()
+            .state
+            .poll_join(waker)
+    }
+
     /// Test task completion.
     /// If complete, return the task output, consuming the handle.
     /// If not complete, gives back the handle.
     pub fn try_join(self) -> Result<T, Self> {
-        let poll = self.0.as_ref().borrow_mut().as_mut().poll_join(None);
-        match poll {
+        match self.poll_join(None) {
             Poll::Ready(value) => Ok(value),
             Poll::Pending => Err(self),
         }
@@ -363,11 +401,7 @@ impl<T> JoinHandle<T> {
 impl<T> Future for JoinHandle<T> {
     type Output = T;
     fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<T> {
-        self.0
-            .as_ref()
-            .borrow_mut()
-            .as_mut()
-            .poll_join(Some(context.waker()))
+        self.poll_join(Some(context.waker()))
     }
 }
 
