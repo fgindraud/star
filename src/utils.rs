@@ -1,3 +1,4 @@
+pub use noop_waker::make_noop_waker;
 pub use pin_cell::PinCell;
 pub use pin_weak::PinWeak;
 
@@ -74,4 +75,25 @@ mod pin_cell {
         let _ref_mut: Pin<&mut NotUnpin> = borrow.as_mut();
         // Does not work: let _ref_mut: &mut NotUnpin = &mut *borrow;
     }
+}
+
+mod noop_waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    /// Waker that does nothing.
+    /// Used for calling `poll()` outside of an await context.
+    pub fn make_noop_waker() -> Waker {
+        unsafe { Waker::from_raw(noop_rawwaker_new()) }
+    }
+
+    fn noop_rawwaker_new() -> RawWaker {
+        RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
+    }
+
+    const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_ptr| noop_rawwaker_new(), // clone
+        |_ptr| (),                  // wake
+        |_ptr| (),                  // wake_by_ref
+        |_ptr| (),                  // drop
+    );
 }
