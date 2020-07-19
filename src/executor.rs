@@ -1,4 +1,4 @@
-use crate::runtime::with_global_runtime_mut;
+use crate::runtime::Runtime;
 use crate::utils::{make_noop_waker, PinCell, PinWeak};
 use core::future::Future;
 use core::mem::ManuallyDrop;
@@ -206,10 +206,10 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
         Self::into_rawwaker(Self::reconstruct_cloned(ptr))
     }
     unsafe fn rawwaker_wake(ptr: *const ()) {
-        schedule_task_global_runtime(Self::reconstruct_owned(ptr))
+        Executor::schedule_task(Self::reconstruct_owned(ptr))
     }
     unsafe fn rawwaker_wake_by_ref(ptr: *const ()) {
-        schedule_task_global_runtime(Self::reconstruct_cloned(ptr))
+        Executor::schedule_task(Self::reconstruct_cloned(ptr))
     }
     unsafe fn rawwaker_drop(ptr: *const ()) {
         drop(Self::reconstruct_owned(ptr))
@@ -262,6 +262,7 @@ impl<T> Future for JoinHandle<T> {
 }
 
 /// Executor: manages the list of ready tasks.
+/// Used through the global runtime instance, hence lots of static methods.
 pub struct Executor {
     ready_tasks: VecDeque<Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>>,
 }
@@ -273,47 +274,35 @@ impl Executor {
         }
     }
 
-    /// Put a task in the `ready_queue` if it is not already there.
-    fn schedule_task(&mut self, task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>) {
+    /// Schedule a task in the global runtime executor.
+    /// Put the task in its `ready_queue` if it is not already there.
+    fn schedule_task(task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>) {
         let already_in_ready_queue = {
             let mut task_borrow = task.as_ref().borrow_mut();
-            let TaskFrameProj { in_ready_queue, .. } = task_borrow.as_mut().proj();
+            let in_ready_queue = task_borrow.as_mut().proj().in_ready_queue;
             let already_in_ready_queue = *in_ready_queue;
             *in_ready_queue = true;
             already_in_ready_queue
         };
         if !already_in_ready_queue {
-            self.ready_tasks.push_back(task)
+            Runtime::with_global_mut(move |rt| rt.executor.ready_tasks.push_back(task))
         }
     }
 
-    /// Get a task from the ready queue.
-    fn next_ready_task(&mut self) -> Option<Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>> {
-        self.ready_tasks.pop_front().map(|task| {
-            *task.as_ref().borrow_mut().as_mut().proj().in_ready_queue = false;
-            task
-        })
-    }
-}
-
-/// Runs the next task in the global runtime executor.
-/// Returns false if there was no task to run.
-pub fn run_ready_task_global_runtime() -> bool {
-    match with_global_runtime_mut(|rt| rt.executor.next_ready_task()) {
-        Some(task) => {
-            // This is split from Executor::next_ready_task() as make_progress() may call with_global_runtime_mut.
-            let mut task_borrow = task.as_ref().borrow_mut();
-            task_borrow.as_mut().proj().state.make_progress();
-            true
+    /// Runs the next task in the global runtime executor.
+    /// Returns false if there was no task to run.
+    pub fn run_next_ready_task() -> bool {
+        match Runtime::with_global_mut(|rt| rt.executor.ready_tasks.pop_front()) {
+            Some(task) => {
+                let mut task_borrow = task.as_ref().borrow_mut();
+                let task_frame = task_borrow.as_mut().proj();
+                *task_frame.in_ready_queue = false;
+                task_frame.state.make_progress();
+                true
+            }
+            None => false,
         }
-        None => false,
     }
-}
-
-/// Schedule a task in the global runtime executor.
-/// Used in implementation of the Wakers and [`spawn()`].
-fn schedule_task_global_runtime(task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>) {
-    with_global_runtime_mut(|rt| rt.executor.schedule_task(task))
 }
 
 /// Creates a new task and return a struct representing completion.
@@ -325,6 +314,6 @@ fn schedule_task_global_runtime(task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgr
 pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
     // TODO optim with boxed future if too large ?
     let task = TaskFrame::new(future);
-    schedule_task_global_runtime(task.clone());
+    Executor::schedule_task(task.clone());
     JoinHandle(task)
 }
