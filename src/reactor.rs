@@ -1,23 +1,9 @@
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 use std::io;
 use std::os::unix::io::RawFd;
-use std::task::Waker;
 use std::time::{Duration, Instant};
-
-/// _Reacts_ to specific events and wake tasks registered on them.
-pub struct Reactor {
-    /// Array used by [`syscall_poll`].
-    /// Placed here so it can be reused between calls, reducing allocations.
-    fd_event_storage: Vec<libc::pollfd>,
-}
-
-/// [`Reactor`] supported event types.
-#[derive(Debug, Clone)]
-pub enum Event {
-    /// Wake when `fd` has any event type in `event`. Used for IO.
-    Fd { fd: RawFd, event: FdEvent },
-    /// Wake when time reaches the given [`Instant`]. Used for timers.
-    Time(Instant),
-}
 
 bitflags::bitflags!(
     /// Possible event types for file descriptors.
@@ -37,19 +23,63 @@ bitflags::bitflags!(
         const WR_NORM = libc::POLLWRNORM;
         const WR_BAND = libc::POLLWRBAND;
         const HUP = libc::POLLHUP;
+        // Indicates an invalid file descriptor -> removes entries linked to this Fd ?
         const NVAL = libc::POLLNVAL;
     }
 );
+
+/// Future which waits until a specific event happens to a file descriptor.
+/// This is a minimal interface to handling async IO.
+///
+/// This can be used as a building block for async IO:
+/// ```
+/// use std::io;
+/// use star::{FdEvent, WaitFdEvent};
+/// use std::os::unix::io::AsRawFd;
+///
+/// async fn async_read<F: io::Read + AsRawFd>(f: &mut F, buf: &mut [u8]) -> io::Result<usize> {
+///     loop {
+///         match f.read(buf) {
+///             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+///                 WaitFdEvent::new(f.as_raw_fd(), FdEvent::IN | FdEvent::ERR).await
+///             }
+///             r => break r,
+///         }
+///     }
+/// }
+/// ```
+pub struct WaitFdEvent(WaitFdEventState);
+
+enum WaitFdEventState {
+    Init { fd: RawFd, event: FdEvent },
+    Registered,
+}
+
+impl WaitFdEvent {
+    pub fn new(fd: RawFd, event: FdEvent) -> WaitFdEvent {
+        WaitFdEvent(WaitFdEventState::Init { fd, event })
+    }
+}
+
+impl Future for WaitFdEvent {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<()> {
+        unimplemented!()
+    }
+}
+
+/// _Reacts_ to specific events and wake tasks registered on them.
+pub struct Reactor {
+    /// Array used by [`syscall_poll`].
+    /// Placed here so it can be reused between calls, reducing allocations.
+    fd_event_storage: Vec<libc::pollfd>,
+}
 
 impl Reactor {
     pub fn new() -> Reactor {
         Reactor {
             fd_event_storage: Vec::new(),
         }
-    }
-
-    pub fn register(&mut self, event: Event, waker: Waker) {
-        unimplemented!()
     }
 
     /// Non-blocking check for events. Returns the number of waken [`Waker`].
@@ -71,13 +101,13 @@ fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<u
             fds.as_mut_ptr(),
             fds.len() as libc::nfds_t,
             match timeout {
-                None => std::ptr::null(),
+                None => core::ptr::null(),
                 Some(t) => &libc::timespec {
                     tv_sec: t.as_secs() as libc::c_long,
                     tv_nsec: t.subsec_nanos() as libc::c_long,
                 },
             },
-            std::ptr::null(),
+            core::ptr::null(),
         )
     };
     match return_code {

@@ -3,7 +3,7 @@
 //! This is a simple basic async runtime.
 //! Intended usage is for async applications requiring only limited performance.
 //! This allows asynchonous IO without the overhead of threads (memory, sync primitives).
-//! 
+//!
 //! The runtime itself is implicitely stored in a [`thread_local`] variable.
 //! This simplifies usage, avoiding having to store references to it in every future.
 //! The runtime is by default disabled and consumes little ressources.
@@ -56,5 +56,4 @@ mod runtime;
 pub use executor::{spawn, JoinHandle};
 pub use runtime::block_on;
 
-// Exported to allow external future implementations to talk to the reactor (which is private).
-pub use reactor::{Event, FdEvent};
+pub use reactor::{FdEvent, WaitFdEvent};
