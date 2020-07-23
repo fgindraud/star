@@ -69,7 +69,6 @@ mod pin_cell {
     fn check_types() {
         use core::marker::PhantomPinned;
         struct NotUnpin(i32, PhantomPinned);
-
         let pc = Box::pin(PinCell::new(NotUnpin(42, PhantomPinned)));
         let mut borrow = pc.as_ref().borrow_mut();
         let _ref_mut: Pin<&mut NotUnpin> = borrow.as_mut();

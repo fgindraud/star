@@ -37,6 +37,7 @@
 //! assert_eq!(value, 42);
 //! ```
 
+mod intrusive_chain;
 mod utils;
 
 /// Executor: executes tasks, stores ready queue, taskframe definitions.
