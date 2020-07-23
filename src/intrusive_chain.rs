@@ -17,30 +17,33 @@ use core::ptr::NonNull;
 /// This struct is [`Unpin`], and all link operations require [`Pin`] references.
 /// This guarantuees that pointers to links are stable (no move allowed).
 struct RawLink {
-    /// None if unlinked, `(prev,next)` pointers if chain (each representing `Pin<&mut RawLink>`).
     /// Not pin structural.
-    prev_next: Option<(NonNull<Self>, NonNull<Self>)>,
+    state: RawLinkState,
     _pin: PhantomPinned,
+}
+
+enum RawLinkState {
+    /// Each pointer is a `Pin<&mut RawLink>`.
+    InChain {
+        prev: NonNull<RawLink>,
+        next: NonNull<RawLink>,
+    },
+    Unlinked,
 }
 
 impl RawLink {
     /// New unlinked raw link.
     fn new() -> Self {
         RawLink {
-            prev_next: None,
+            state: RawLinkState::Unlinked,
             _pin: PhantomPinned,
         }
     }
 
     fn is_linked(&self) -> bool {
-        self.prev_next.is_some()
-    }
-
-    /// Access prev and next pointers assuming the RawLink is linked.
-    unsafe fn unchecked_mut_prev_next(&mut self) -> &mut (NonNull<Self>, NonNull<Self>) {
-        match self.prev_next.as_mut() {
-            Some(prev_next) => prev_next,
-            None => unreachable_unchecked(),
+        match self.state {
+            RawLinkState::Unlinked => false,
+            _ => true,
         }
     }
 
@@ -53,15 +56,25 @@ impl RawLink {
         unsafe {
             // Inner content is not pin-structural
             let self_mut = self.get_unchecked_mut();
-            if let Some((mut p_ptr, mut n_ptr)) = self_mut.prev_next {
+            if let RawLinkState::InChain {
+                prev: mut p_ptr,
+                next: mut n_ptr,
+            } = self_mut.state
+            {
                 // self in a chain => p & n are pinned raw links in a chain.
                 // Set p.next = n & n.prev = p
                 // if p == n == self: singleton, no need to change pointers.
                 if p_ptr != NonNull::new_unchecked(self_mut) {
-                    p_ptr.as_mut().unchecked_mut_prev_next().1 = n_ptr;
-                    n_ptr.as_mut().unchecked_mut_prev_next().0 = p_ptr
+                    match &mut p_ptr.as_mut().state {
+                        RawLinkState::InChain { next, .. } => *next = n_ptr,
+                        _ => unreachable_unchecked(),
+                    }
+                    match &mut n_ptr.as_mut().state {
+                        RawLinkState::InChain { prev, .. } => *prev = p_ptr,
+                        _ => unreachable_unchecked(),
+                    }
                 }
-                self_mut.prev_next = None;
+                self_mut.state = RawLinkState::Unlinked;
             }
         }
     }
@@ -80,18 +93,32 @@ impl RawLink {
             let self_ptr = NonNull::new_unchecked(self_mut);
             let other_ptr = NonNull::new_unchecked(other);
 
-            match &mut self_mut.prev_next {
-                Some((self_prev, _)) => {
+            match &mut self_mut.state {
+                RawLinkState::InChain {
+                    prev: self_prev, ..
+                } => {
                     // p & self in a chain
                     let mut p_ptr = *self_prev;
-                    p_ptr.as_mut().unchecked_mut_prev_next().1 = other_ptr;
+                    match &mut p_ptr.as_mut().state {
+                        RawLinkState::InChain { next, .. } => *next = other_ptr,
+                        _ => unreachable_unchecked(),
+                    }
                     *self_prev = other_ptr;
-                    other.prev_next = Some((p_ptr, self_ptr))
+                    other.state = RawLinkState::InChain {
+                        prev: p_ptr,
+                        next: self_ptr,
+                    }
                 }
-                prev_next => {
+                self_state => {
                     // self unlinked
-                    *prev_next = Some((other_ptr, other_ptr));
-                    other.prev_next = Some((self_ptr, self_ptr))
+                    *self_state = RawLinkState::InChain {
+                        prev: other_ptr,
+                        next: other_ptr,
+                    };
+                    other.state = RawLinkState::InChain {
+                        prev: self_ptr,
+                        next: self_ptr,
+                    }
                 }
             }
         }
