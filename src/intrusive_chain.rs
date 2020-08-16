@@ -11,6 +11,7 @@ use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
+use core::ptr::NonNull;
 use std::error::Error;
 
 /// Basic link that can **safely** form a doubly-linked circular chain with other pinned instances.
@@ -70,18 +71,18 @@ impl RawLink {
         self.next.get() == self
     }
 
-    fn try_borrow<'l>(&'l self) -> Result<RawLinkBorrow<'l>, BorrowError> {
+    fn try_borrow(self: Pin<&Self>) -> Result<RawLinkBorrow, BorrowError> {
         RawLinkBorrow::new(self)
     }
-    fn borrow<'l>(&'l self) -> RawLinkBorrow<'l> {
+    fn borrow(self: Pin<&Self>) -> RawLinkBorrow {
         self.try_borrow().unwrap()
     }
 
-    fn try_borrow_mut<'l>(&'l self) -> Result<RawLinkBorrowMut<'l>, BorrowMutError> {
-        RawLinkBorrowMut::new(self)
+    fn increment_ref_count(&self) {
+        self.references.set(self.references.get().wrapping_add(1))
     }
-    fn borrow_mut<'l>(&'l self) -> RawLinkBorrowMut<'l> {
-        self.try_borrow_mut().unwrap()
+    fn decrement_ref_count(&self) {
+        self.references.set(self.references.get().wrapping_sub(1))
     }
 
     /// If self is linked:
@@ -143,37 +144,76 @@ impl RawLink {
 impl Drop for RawLink {
     fn drop(&mut self) {
         // Drop has borrowed self mutably.
-        // Check with dynamic borrow that it could actually do so before continuing.
-        // If not, panic as there is no way to indicate an error of stop drop().
-        let _mut_guard = self.borrow_mut();
+        // This is only allowed if the link is not referenced.
+        // Otherwise panic as there is no way to indicate an error of stop drop().
+        if self.references.get() != UNREFERENCED {
+            panic!("Drop on referenced RawLink")
+        }
         self.unlink()
     }
 }
 
-/// Shared immutable borrow guard.
+/// Shared immutable borrow guard for a [`RawLink`].
 ///
 /// Holds a `+1` value in the reference count sum.
-/// In case of overflow, use wraparound which will cause next borrow to fail (no UB).
-struct RawLinkBorrow<'l> {
-    link: &'l RawLink,
+/// In case of overflow, use wrap-around which will cause next borrow to fail (no UB).
+///
+/// This guard has no lifetime linking it to the `RawLink`.
+/// But it guarantees that the `RawLink` exists as long as the guard exists, due to:
+/// 1. The `RawLink` destructor must run before destruction, as `new` takes a pinned `RawLink`.
+/// 2. `RawLink` destructor panics if references still exist.
+struct RawLinkBorrow {
+    link: NonNull<RawLink>,
 }
 
-impl<'l> RawLinkBorrow<'l> {
-    fn new(link: &'l RawLink) -> Result<Self, BorrowError> {
+impl RawLinkBorrow {
+    fn new(link: Pin<&RawLink>) -> Result<Self, BorrowError> {
+        let link = link.get_ref();
         let ref_count = link.references.get();
         if ref_count >= 0 {
-            link.references.set(ref_count.wrapping_add(1));
-            Ok(RawLinkBorrow { link })
+            link.increment_ref_count();
+            Ok(RawLinkBorrow { link: link.into() })
+        } else {
+            Err(BorrowError)
+        }
+    }
+
+    fn link(&self) -> Pin<&RawLink> {
+        // SAFETY : link is alive due to reference count preventing, and pinned due to new().
+        unsafe { Pin::new_unchecked(self.link.as_ref()) }
+    }
+
+    fn next(&self) -> Result<Self, BorrowError> {
+        let link = self.link();
+        if link.is_linked() {
+            // SAFETY: linked, so `next` points to valid pinned raw_link
+            RawLinkBorrow::new(unsafe { Pin::new_unchecked(&*link.next.get()) })
+        } else {
+            Err(BorrowError)
+        }
+    }
+
+    fn prev(&self) -> Result<Self, BorrowError> {
+        let link = self.link();
+        if link.is_linked() {
+            // SAFETY: linked, so `prev` points to valid pinned raw_link
+            RawLinkBorrow::new(unsafe { Pin::new_unchecked(&*link.prev.get()) })
         } else {
             Err(BorrowError)
         }
     }
 }
 
-impl<'l> Drop for RawLinkBorrow<'l> {
+impl Clone for RawLinkBorrow {
+    fn clone(&self) -> Self {
+        self.link().increment_ref_count();
+        RawLinkBorrow { link: self.link }
+    }
+}
+
+impl Drop for RawLinkBorrow {
     fn drop(&mut self) {
-        let ref_count = self.link.references.get();
-        self.link.references.set(ref_count.wrapping_sub(1))
+        self.link().decrement_ref_count()
     }
 }
 
@@ -187,27 +227,29 @@ impl fmt::Display for BorrowError {
 }
 impl Error for BorrowError {}
 
-/// Exclusive mutable borrow guard.
+/// Exclusive mutable borrow guard for a [`RawLink`].
 ///
 /// Only one can exist at anytime.
-struct RawLinkBorrowMut<'l> {
-    link: &'l RawLink,
+/// TODO: model is upgrading from a shared borrow, checking ref_count == 1.
+struct RawLinkBorrowMut<'b> {
+    borrow: &'b mut RawLinkBorrow,
 }
 
-impl<'l> RawLinkBorrowMut<'l> {
-    fn new(link: &'l RawLink) -> Result<Self, BorrowMutError> {
-        if link.references.get() == UNREFERENCED {
+impl<'b> RawLinkBorrowMut<'b> {
+    fn new(borrow: &'b mut RawLinkBorrow) -> Result<Self, BorrowMutError> {
+        let link = borrow.link();
+        if link.references.get() == 1 {
             link.references.set(EXCLUSIVE_REFERENCE);
-            Ok(RawLinkBorrowMut { link })
+            Ok(RawLinkBorrowMut { borrow })
         } else {
             Err(BorrowMutError)
         }
     }
 }
 
-impl<'l> Drop for RawLinkBorrowMut<'l> {
+impl<'b> Drop for RawLinkBorrowMut<'b> {
     fn drop(&mut self) {
-        self.link.references.set(UNREFERENCED)
+        self.borrow.link().references.set(1)
     }
 }
 
@@ -237,6 +279,18 @@ impl<T> Link<T> {
             value: UnsafeCell::new(value),
         }
     }
+
+    fn pinned_raw(self: Pin<&Self>) -> Pin<&RawLink> {
+        // SAFETY : raw is pin-structural
+        unsafe { Pin::new_unchecked(&self.get_ref().raw) }
+    }
+
+    pub fn try_borrow(self: Pin<&Self>) -> Result<LinkBorrow<T>, BorrowError> {
+        Ok(LinkBorrow {
+            raw_guard: RawLinkBorrow::new(self.pinned_raw())?,
+            _marker: PhantomData,
+        })
+    }
 }
 
 /// Chain access point.
@@ -254,8 +308,46 @@ impl<T> Chain<T> {
         }
     }
 
-    pub fn push_front(chain: Pin<&mut Self>, link: Pin<&mut Link<T>>) {
+    fn pinned_raw(self: Pin<&Self>) -> Pin<&RawLink> {
+        // SAFETY : raw is pin-structural
+        unsafe { Pin::new_unchecked(&self.get_ref().raw) }
+    }
+
+    pub fn push_front(chain: Pin<&Self>, link: Pin<&Link<T>>) {
         unimplemented!()
+    }
+
+    pub fn try_borrow_front(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
+        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.next()?;
+        Ok(match raw_guard.link().link_type {
+            RawLinkType::Chain => None,
+            RawLinkType::Link => Some(unsafe { LinkBorrow::new(raw_guard) }),
+        })
+    }
+
+    pub fn try_borrow_back(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
+        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.prev()?;
+        Ok(match raw_guard.link().link_type {
+            RawLinkType::Chain => None,
+            RawLinkType::Link => Some(unsafe { LinkBorrow::new(raw_guard) }),
+        })
+    }
+}
+
+/// Represents a shared borrow of a [`Link`].
+pub struct LinkBorrow<T> {
+    raw_guard: RawLinkBorrow,
+    _marker: PhantomData<*const T>,
+}
+
+impl<T> LinkBorrow<T> {
+    /// Upgrade a [`RawLinkBorrow`] to a [`LinkBorrow`].
+    /// Safety : the raw link must be one from a `Link<T>`.
+    unsafe fn new(raw_guard: RawLinkBorrow) -> Self {
+        LinkBorrow {
+            raw_guard,
+            _marker: PhantomData,
+        }
     }
 }
 
