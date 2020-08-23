@@ -12,6 +12,7 @@ use core::fmt;
 use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
 use core::ptr::NonNull;
+use pin_project::pin_project;
 use std::error::Error;
 
 /// Basic link that can **safely** form a doubly-linked circular chain with other pinned instances.
@@ -288,10 +289,13 @@ impl Error for BorrowMutError {}
 
 /// A value that can be threaded in a chain.
 /// Each [`Link`] can be in only one [`Chain`] at a time, and only once.
+#[pin_project]
 #[repr(C)]
 pub struct Link<T: ?Sized> {
     /// RawLink is first element with repr(C) to allow static casting between raw <-> self
+    #[pin]
     raw: RawLink,
+    #[pin]
     value: UnsafeCell<T>,
 }
 
@@ -303,20 +307,23 @@ impl<T> Link<T> {
         }
     }
 
-    fn pinned_raw(self: Pin<&Self>) -> Pin<&RawLink> {
-        // SAFETY : raw is pin-structural
-        unsafe { Pin::new_unchecked(&self.get_ref().raw) }
+    /// Is the link part of a chain ?
+    pub fn is_linked(&self) -> bool {
+        self.raw.is_linked()
     }
 
+    /// Get a shared borrow of the link (and its value).
     pub fn try_borrow(self: Pin<&Self>) -> Result<LinkBorrow<T>, BorrowError> {
-        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?;
+        let raw_guard = RawLinkBorrow::new(self.project_ref().raw)?;
         Ok(unsafe { LinkBorrow::new(raw_guard) })
     }
 }
 
 /// Chain head
+#[pin_project]
 pub struct Chain<T: ?Sized> {
     /// Has a link like others, but no value
+    #[pin]
     raw: RawLink,
     _marker: PhantomData<*const UnsafeCell<T>>,
 }
@@ -329,25 +336,20 @@ impl<T> Chain<T> {
         }
     }
 
-    fn pinned_raw(self: Pin<&Self>) -> Pin<&RawLink> {
-        // SAFETY : raw is pin-structural
-        unsafe { Pin::new_unchecked(&self.get_ref().raw) }
-    }
-
     /// TODO doc
-    pub fn push_back(chain: Pin<&Self>, link: Pin<&Link<T>>) {
-        chain.pinned_raw().insert_prev(link.pinned_raw())
+    pub fn push_back(self: Pin<&Self>, link: Pin<&Link<T>>) {
+        self.project_ref().raw.insert_prev(link.project_ref().raw)
     }
 
     /// TODO doc
     pub fn try_borrow_front(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
-        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.next()?;
+        let raw_guard = RawLinkBorrow::new(self.project_ref().raw)?.next()?;
         Ok(unsafe { LinkBorrow::new_or_chain(raw_guard) })
     }
 
     /// TODO doc
     pub fn try_borrow_back(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
-        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.prev()?;
+        let raw_guard = RawLinkBorrow::new(self.project_ref().raw)?.prev()?;
         Ok(unsafe { LinkBorrow::new_or_chain(raw_guard) })
     }
 }
