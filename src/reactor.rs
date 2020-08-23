@@ -1,3 +1,4 @@
+use crate::intrusive_chain::{Chain, Link};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -9,7 +10,7 @@ bitflags::bitflags!(
     /// Possible event types for file descriptors.
     /// These event types are those supported by [`libc::poll`].
     /// See `poll()` syscall manpage for details.
-    pub struct FdEvent: libc::c_short {
+    pub struct FdEventType: libc::c_short {
         /// Data can be read
         const IN = libc::POLLIN;
         /// Data can be written
@@ -34,14 +35,14 @@ bitflags::bitflags!(
 /// This can be used as a building block for async IO:
 /// ```
 /// use std::io;
-/// use star::{FdEvent, WaitFdEvent};
+/// use star::{FdEventType, WaitFdEvent};
 /// use std::os::unix::io::AsRawFd;
 ///
 /// async fn async_read<F: io::Read + AsRawFd>(f: &mut F, buf: &mut [u8]) -> io::Result<usize> {
 ///     loop {
 ///         match f.read(buf) {
 ///             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-///                 WaitFdEvent::new(f.as_raw_fd(), FdEvent::IN | FdEvent::ERR).await
+///                 WaitFdEvent::new(f.as_raw_fd(), FdEventType::IN | FdEventType::ERR).await
 ///             }
 ///             r => break r,
 ///         }
@@ -50,14 +51,25 @@ bitflags::bitflags!(
 /// ```
 pub struct WaitFdEvent(WaitFdEventState);
 
+struct FdEventRegistration {
+    fd: RawFd,
+    event_type: FdEventType,
+    waker: Waker,
+}
+
 enum WaitFdEventState {
-    Init { fd: RawFd, event: FdEvent },
-    Registered,
+    Init {
+        fd: RawFd,
+        event_type: FdEventType,
+    },
+    Registered {
+        registration: Link<FdEventRegistration>,
+    },
 }
 
 impl WaitFdEvent {
-    pub fn new(fd: RawFd, event: FdEvent) -> WaitFdEvent {
-        WaitFdEvent(WaitFdEventState::Init { fd, event })
+    pub fn new(fd: RawFd, event_type: FdEventType) -> WaitFdEvent {
+        WaitFdEvent(WaitFdEventState::Init { fd, event_type })
     }
 }
 
@@ -73,12 +85,15 @@ pub struct Reactor {
     /// Array used by [`syscall_poll`].
     /// Placed here so it can be reused between calls, reducing allocations.
     fd_event_storage: Vec<libc::pollfd>,
+
+    registered_fd_events: Chain<FdEventRegistration>,
 }
 
 impl Reactor {
     pub fn new() -> Reactor {
         Reactor {
             fd_event_storage: Vec::new(),
+            registered_fd_events: Chain::new(),
         }
     }
 

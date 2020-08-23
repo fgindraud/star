@@ -57,4 +57,4 @@ mod runtime;
 pub use executor::{spawn, JoinHandle};
 pub use runtime::block_on;
 
-pub use reactor::{FdEvent, WaitFdEvent};
+pub use reactor::{FdEventType, WaitFdEvent};

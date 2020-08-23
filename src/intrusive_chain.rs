@@ -202,6 +202,19 @@ impl RawLinkBorrow {
             Err(BorrowError)
         }
     }
+
+    /// Convert borrow to an exclusive one if ref_count is 1.
+    fn to_exclusive(self) -> Result<RawLinkBorrowMut, BorrowMutError> {
+        let link = self.link();
+        if link.references.get() == 1 {
+            link.references.set(EXCLUSIVE_REFERENCE);
+            let link = self.link;
+            core::mem::forget(self);
+            Ok(RawLinkBorrowMut { link })
+        } else {
+            Err(BorrowMutError)
+        }
+    }
 }
 
 impl Clone for RawLinkBorrow {
@@ -228,28 +241,38 @@ impl fmt::Display for BorrowError {
 impl Error for BorrowError {}
 
 /// Exclusive mutable borrow guard for a [`RawLink`].
-///
-/// Only one can exist at anytime.
-/// TODO: model is upgrading from a shared borrow, checking ref_count == 1.
-struct RawLinkBorrowMut<'b> {
-    borrow: &'b mut RawLinkBorrow,
+struct RawLinkBorrowMut {
+    link: NonNull<RawLink>,
 }
 
-impl<'b> RawLinkBorrowMut<'b> {
-    fn new(borrow: &'b mut RawLinkBorrow) -> Result<Self, BorrowMutError> {
-        let link = borrow.link();
-        if link.references.get() == 1 {
+impl RawLinkBorrowMut {
+    fn new(link: Pin<&RawLink>) -> Result<Self, BorrowMutError> {
+        let link = link.get_ref();
+        if link.references.get() == UNREFERENCED {
             link.references.set(EXCLUSIVE_REFERENCE);
-            Ok(RawLinkBorrowMut { borrow })
+            Ok(RawLinkBorrowMut { link: link.into() })
         } else {
             Err(BorrowMutError)
         }
     }
+
+    fn link(&self) -> Pin<&RawLink> {
+        // SAFETY : link is alive due to reference count preventing drop, and pinned due to new().
+        unsafe { Pin::new_unchecked(self.link.as_ref()) }
+    }
+
+    /// Convert exclusive borrow into shared borrow (with `ref_count == 1`).
+    fn to_shared(self) -> RawLinkBorrow {
+        self.link().references.set(1);
+        let link = self.link;
+        core::mem::forget(self);
+        RawLinkBorrow { link }
+    }
 }
 
-impl<'b> Drop for RawLinkBorrowMut<'b> {
+impl Drop for RawLinkBorrowMut {
     fn drop(&mut self) {
-        self.borrow.link().references.set(1)
+        self.link().references.set(UNREFERENCED)
     }
 }
 
@@ -286,18 +309,16 @@ impl<T> Link<T> {
     }
 
     pub fn try_borrow(self: Pin<&Self>) -> Result<LinkBorrow<T>, BorrowError> {
-        Ok(LinkBorrow {
-            raw_guard: RawLinkBorrow::new(self.pinned_raw())?,
-            _marker: PhantomData,
-        })
+        let raw_guard = RawLinkBorrow::new(self.pinned_raw())?;
+        Ok(unsafe { LinkBorrow::new(raw_guard) })
     }
 }
 
-/// Chain access point.
+/// Chain head
 pub struct Chain<T: ?Sized> {
     /// Has a link like others, but no value
     raw: RawLink,
-    _marker: PhantomData<*const T>,
+    _marker: PhantomData<*const UnsafeCell<T>>,
 }
 
 impl<T> Chain<T> {
@@ -313,24 +334,21 @@ impl<T> Chain<T> {
         unsafe { Pin::new_unchecked(&self.get_ref().raw) }
     }
 
-    pub fn push_front(chain: Pin<&Self>, link: Pin<&Link<T>>) {
-        unimplemented!()
+    /// TODO doc
+    pub fn push_back(chain: Pin<&Self>, link: Pin<&Link<T>>) {
+        chain.pinned_raw().insert_prev(link.pinned_raw())
     }
 
+    /// TODO doc
     pub fn try_borrow_front(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
         let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.next()?;
-        Ok(match raw_guard.link().link_type {
-            RawLinkType::Chain => None,
-            RawLinkType::Link => Some(unsafe { LinkBorrow::new(raw_guard) }),
-        })
+        Ok(unsafe { LinkBorrow::new_or_chain(raw_guard) })
     }
 
+    /// TODO doc
     pub fn try_borrow_back(self: Pin<&Self>) -> Result<Option<LinkBorrow<T>>, BorrowError> {
         let raw_guard = RawLinkBorrow::new(self.pinned_raw())?.prev()?;
-        Ok(match raw_guard.link().link_type {
-            RawLinkType::Chain => None,
-            RawLinkType::Link => Some(unsafe { LinkBorrow::new(raw_guard) }),
-        })
+        Ok(unsafe { LinkBorrow::new_or_chain(raw_guard) })
     }
 }
 
@@ -342,11 +360,20 @@ pub struct LinkBorrow<T> {
 
 impl<T> LinkBorrow<T> {
     /// Upgrade a [`RawLinkBorrow`] to a [`LinkBorrow`].
-    /// Safety : the raw link must be one from a `Link<T>`.
+    /// Safety : the raw link must be one from a `Link<T>`, in a chain with only `Link<T>` and `Chain<T>` nodes.
     unsafe fn new(raw_guard: RawLinkBorrow) -> Self {
         LinkBorrow {
             raw_guard,
             _marker: PhantomData,
+        }
+    }
+
+    /// Upgrade a [`RawLinkBorrow`] to a [`LinkBorrow`] if it is a link.
+    /// Safety : the raw link must be from a chain with only `Link<T>` and `Chain<T>` nodes.
+    unsafe fn new_or_chain(raw_guard: RawLinkBorrow) -> Option<Self> {
+        match raw_guard.link().link_type {
+            RawLinkType::Link => Some(LinkBorrow::new(raw_guard)),
+            RawLinkType::Chain => None,
         }
     }
 }
