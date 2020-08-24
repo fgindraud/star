@@ -148,13 +148,22 @@ impl Reactor {
     /// Non-blocking check for events. Returns the number of waken [`Waker`].
     pub fn poll(self: Pin<&mut Self>) -> Result<usize, io::Error> {
         let self_proj = self.project();
-        self_proj.fd_event_storage.clear();
 
-        let iter = self_proj
-            .registered_fd_events
-            .as_ref()
-            .try_borrow_front()
-            .unwrap();
+        self_proj.fd_event_storage.clear();
+        let mut iter = self_proj.registered_fd_events.as_ref().borrow_front();
+        while let Some(registration) = iter.take() {
+            iter = registration.next();
+            let value = registration.link().value();
+            self_proj.fd_event_storage.push(libc::pollfd {
+                fd: value.fd,
+                events: value.event_type.bits(),
+                revents: FdEventType::empty().bits(),
+            })
+        }
+
+        let events = syscall_poll(self_proj.fd_event_storage.as_mut_slice(), None)?;
+
+        // TODO Loop zipped(fdestorage, registrations), unlink triggered
 
         Ok(0)
     }
