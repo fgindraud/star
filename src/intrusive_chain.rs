@@ -20,6 +20,7 @@ use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
 use core::ptr::NonNull;
 use pin_project::pin_project;
+use std::thread;
 
 /// Basic link that can **safely** form a doubly-linked circular chain with other pinned instances.
 /// Conceptually, this struct owns the _participation in a chain_.
@@ -128,13 +129,11 @@ impl RawLink {
 /// Panics if the link is referenced.
 impl Drop for RawLink {
     fn drop(&mut self) {
-        // Drop has borrowed self mutably.
-        // This is only allowed if the link is not referenced.
-        // Otherwise panic as there is no way to indicate an error of stop drop().
+        self.unlink();
+        // Panic if the link is referenced.
         if self.references.get() > 0 {
             panic!("Drop on referenced RawLink")
         }
-        self.unlink()
     }
 }
 
@@ -198,7 +197,14 @@ impl Clone for RawLinkBorrow {
 
 impl Drop for RawLinkBorrow {
     fn drop(&mut self) {
-        self.link().decrement_ref_count()
+        // When a reference RawLink is dropped, RawLink::drop() will panic.
+        // This does not prevent drop of containing structs (like Box), so the RawLink memory may be invalid.
+        // Thus to prevent accessing the RawLink memory, do not decrement if in a panic context.
+        // Due to the intrusive list stuff being !Sync !Send, this Borrow is in the same thread as the RawLink.
+        // A consequence is that the RawLink will be poisoned on panic, as it will be still referenced.
+        if !thread::panicking() {
+            self.link().decrement_ref_count()
+        }
     }
 }
 
@@ -281,7 +287,11 @@ impl<T> Chain<T> {
 }
 
 /// Represents a borrow of a [`Link`].
-/// Ensures that the link is not dropped as long as it exists.
+/// Will generate a panic if the referenced link is dropped.
+///
+/// If a panic occurs, this borrow will **not** remove itself from the reference count (required by safety).
+/// This makes the Link **poisoned**, in a sense that it will panic on destruction.
+/// Thus it is advised to borrow links for the shortest time possible.
 pub struct LinkBorrow<T> {
     raw_guard: RawLinkBorrow,
     _marker: PhantomData<*const T>,
@@ -359,10 +369,13 @@ fn test_borrow_direct_panic() {
 #[should_panic]
 fn test_borrow_indirect_panic() {
     let chain = Box::pin(Chain::new());
-    let link = Box::pin(Link::new(0));
-    chain.as_ref().push_back(link.as_ref());
-    let _borrow = chain.as_ref().borrow_front().unwrap();
-    drop(link)
+    let link0 = Box::pin(Link::new(0));
+    let link1 = Box::pin(Link::new(1));
+    chain.as_ref().push_back(link0.as_ref());
+    chain.as_ref().push_back(link1.as_ref());
+
+    let _link0_borrow = chain.as_ref().borrow_front().unwrap();
+    drop(link0)
 }
 
 #[test]
@@ -374,5 +387,5 @@ fn test_chain() {
     chain.as_ref().push_back(link1.as_ref());
 
     let link1_borrow = chain.as_ref().borrow_front().unwrap().next().unwrap();
-    assert_eq!(link1_borrow.link().value(), 1);
+    assert_eq!(link1_borrow.link().value(), &1);
 }
