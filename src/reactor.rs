@@ -148,24 +148,21 @@ impl Reactor {
     /// Non-blocking check for events. Returns the number of waken [`Waker`].
     pub fn poll(self: Pin<&mut Self>) -> Result<usize, io::Error> {
         let self_proj = self.project();
-
-        self_proj.fd_event_storage.clear();
-        let mut iter = self_proj.registered_fd_events.as_ref().borrow_front();
-        while let Some(registration) = iter.take() {
-            iter = registration.next();
-            let value = registration.link().value();
-            self_proj.fd_event_storage.push(libc::pollfd {
-                fd: value.fd,
-                events: value.event_type.bits(),
-                revents: FdEventType::empty().bits(),
-            })
+        setup_pollfd_vec(
+            self_proj.fd_event_storage,
+            self_proj.registered_fd_events.as_ref(),
+        );
+        if self_proj.fd_event_storage.is_empty() {
+            return Ok(0);
         }
-
-        let events = syscall_poll(self_proj.fd_event_storage.as_mut_slice(), None)?;
-
-        // TODO Loop zipped(fdestorage, registrations), unlink triggered
-
-        Ok(0)
+        if syscall_poll(self_proj.fd_event_storage, Some(Duration::new(0, 0)))? == 0 {
+            return Ok(0);
+        }
+        let n = wake_triggered_fd_events(
+            self_proj.registered_fd_events.as_ref(),
+            self_proj.fd_event_storage,
+        );
+        Ok(n)
     }
 
     /// Blocking wait for events. Returns the number of waken [`Waker`].
@@ -173,6 +170,39 @@ impl Reactor {
         // In case of interruption, retry
         unimplemented!()
     }
+}
+
+fn setup_pollfd_vec(
+    pollfds: &mut Vec<libc::pollfd>,
+    registrations: Pin<&Chain<FdEventRegistration>>,
+) {
+    pollfds.clear();
+    for registration in registrations.iter() {
+        let value = registration.link().value();
+        pollfds.push(libc::pollfd {
+            fd: value.fd,
+            events: value.event_type.bits(),
+            revents: FdEventType::empty().bits(),
+        })
+    }
+}
+
+fn wake_triggered_fd_events(
+    registrations: Pin<&Chain<FdEventRegistration>>,
+    pollfds: &[libc::pollfd],
+) -> usize {
+    let mut n_waken = 0;
+    for (registration, pollfd) in Iterator::zip(registrations.iter(), pollfds.into_iter()) {
+        let events = FdEventType::from_bits_truncate(pollfd.events);
+        let revents = FdEventType::from_bits_truncate(pollfd.revents);
+        if events.intersects(revents) {
+            let link = registration.link();
+            link.unlink();
+            link.value().waker.wake_by_ref();
+            n_waken += 1;
+        }
+    }
+    n_waken
 }
 
 /// Safe wrapper around [`libc::ppoll()`] syscall

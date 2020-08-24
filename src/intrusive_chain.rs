@@ -284,6 +284,13 @@ impl<T> Chain<T> {
         let raw_guard = RawLinkBorrow::new(self.project_ref().raw).prev()?;
         unsafe { LinkBorrow::new_or_chain(raw_guard) }
     }
+
+    /// Iterator (forward) over the chain.
+    pub fn iter(self: Pin<&Self>) -> Iter<T> {
+        Iter {
+            next_link: self.borrow_front(),
+        }
+    }
 }
 
 /// Represents a borrow of a [`Link`].
@@ -326,11 +333,27 @@ impl<T> LinkBorrow<T> {
         }
     }
 
+    pub fn next(&self) -> Option<LinkBorrow<T>> {
+        unsafe { LinkBorrow::new_or_chain(self.raw_guard.next()?) }
+    }
     pub fn prev(&self) -> Option<LinkBorrow<T>> {
         unsafe { LinkBorrow::new_or_chain(self.raw_guard.prev()?) }
     }
-    pub fn next(&self) -> Option<LinkBorrow<T>> {
-        unsafe { LinkBorrow::new_or_chain(self.raw_guard.next()?) }
+}
+
+/// Iterator over a chain
+pub struct Iter<T> {
+    next_link: Option<LinkBorrow<T>>,
+}
+
+impl<T> Iterator for Iter<T> {
+    type Item = LinkBorrow<T>;
+    fn next(&mut self) -> Option<LinkBorrow<T>> {
+        let next_link = self.next_link.take();
+        if let Some(link) = &next_link {
+            self.next_link = link.next();
+        }
+        next_link
     }
 }
 
@@ -388,4 +411,7 @@ fn test_chain() {
 
     let link1_borrow = chain.as_ref().borrow_front().unwrap().next().unwrap();
     assert_eq!(link1_borrow.link().value(), &1);
+
+    let values: Vec<i32> = chain.as_ref().iter().map(|b| *b.link().value()).collect();
+    assert_eq!(&values, &[0, 1]);
 }
