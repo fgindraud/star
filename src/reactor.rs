@@ -107,7 +107,7 @@ impl Future for WaitFdEvent {
                         rt.project()
                             .reactor
                             .project()
-                            .registered_fd_events
+                            .fd_event_registrations
                             .as_ref()
                             .push_back(registration.as_ref())
                     }),
@@ -195,9 +195,12 @@ impl Future for WaitTime {
                     });
                     match state.project() {
                         Registered { registration } => Runtime::with_global_mut(|rt| {
-                            let time_events = rt.project().reactor.project().registered_time_events;
-                            // FIXME insert sorted by Instant
-                            time_events.as_ref().push_back(registration.as_ref())
+                            let registrations = rt.project().reactor.project().time_registrations;
+                            insert_sorted_by_key(
+                                registrations.as_ref(),
+                                registration.as_ref(),
+                                |r| r.when,
+                            )
                         }),
                         _ => unreachable!(),
                     }
@@ -220,26 +223,41 @@ impl Future for WaitTime {
     }
 }
 
+fn insert_sorted_by_key<T, F, K>(chain: Pin<&Chain<T>>, link: Pin<&Link<T>>, mut f: F)
+where
+    F: FnMut(&T) -> K,
+    K: Ord,
+{
+    let link_key = f(link.value());
+    for l in chain.iter() {
+        if link_key <= f(l.link().value()) {
+            l.link().insert_prev(link);
+            return;
+        }
+    }
+    chain.push_back(link)
+}
+
 /// _Reacts_ to specific events and wake tasks registered on them.
 #[pin_project]
 pub struct Reactor {
     /// List of registered events not already triggered.
     #[pin]
-    registered_fd_events: Chain<FdEventRegistration>,
+    fd_event_registrations: Chain<FdEventRegistration>,
     /// List of time events not already triggered, sorted by increasing [`Instant`] values.
     #[pin]
-    registered_time_events: Chain<TimeRegistration>,
+    time_registrations: Chain<TimeRegistration>,
     /// Array used by [`syscall_poll`].
     /// Placed here so it can be reused between calls, reducing allocations.
-    fd_event_storage: Vec<libc::pollfd>,
+    pollfds_storage: Vec<libc::pollfd>,
 }
 
 impl Reactor {
     pub fn new() -> Reactor {
         Reactor {
-            registered_fd_events: Chain::new(),
-            registered_time_events: Chain::new(),
-            fd_event_storage: Vec::new(),
+            fd_event_registrations: Chain::new(),
+            time_registrations: Chain::new(),
+            pollfds_storage: Vec::new(),
         }
     }
 
@@ -247,18 +265,18 @@ impl Reactor {
     pub fn poll(self: Pin<&mut Self>) -> Result<usize, io::Error> {
         let self_proj = self.project();
         setup_pollfd_vec(
-            self_proj.fd_event_storage,
-            self_proj.registered_fd_events.as_ref(),
+            self_proj.pollfds_storage,
+            self_proj.fd_event_registrations.as_ref(),
         );
-        if self_proj.fd_event_storage.is_empty() {
+        if self_proj.pollfds_storage.is_empty() {
             return Ok(0);
         }
-        if syscall_poll(self_proj.fd_event_storage, Some(Duration::new(0, 0)))? == 0 {
+        if syscall_poll(self_proj.pollfds_storage, Some(Duration::new(0, 0)))? == 0 {
             return Ok(0);
         }
         let n = wake_triggered_fd_events(
-            self_proj.registered_fd_events.as_ref(),
-            self_proj.fd_event_storage,
+            self_proj.fd_event_registrations.as_ref(),
+            self_proj.pollfds_storage,
         );
         Ok(n)
     }
@@ -276,7 +294,7 @@ fn setup_pollfd_vec(
 ) {
     pollfds.clear();
     for registration in registrations.iter() {
-        let value = registration.link().value();
+        let value = registration.link().get_ref().value();
         pollfds.push(libc::pollfd {
             fd: value.fd,
             events: value.event_type.bits(),

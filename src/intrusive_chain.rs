@@ -240,6 +240,11 @@ impl<T> Link<T> {
         self.raw.unlink()
     }
 
+    /// Insert the `link` to on the left of `self`. Unlinks it beforehand.
+    pub fn insert_prev(self: Pin<&Self>, link: Pin<&Link<T>>) {
+        self.project_ref().raw.insert_prev(link.project_ref().raw)
+    }
+
     /// Get a dynamic borrow to the next link in the chain.
     pub fn next(&self) -> Option<LinkBorrow<T>> {
         // SAFETY : can only be inserted in a Chain with Link<T>
@@ -293,7 +298,7 @@ impl<T> Chain<T> {
     }
 }
 
-/// Dyanmic borrow of a [`Link`].
+/// Dynamic borrow of a pinned [`Link`].
 /// Will generate a panic if the dynamically referenced link is dropped.
 ///
 /// If a panic occurs, this borrow will **not** remove itself from the reference count (required by safety).
@@ -306,7 +311,7 @@ pub struct LinkBorrow<T> {
 
 impl<T> LinkBorrow<T> {
     /// Upgrade a [`RawLinkBorrow`] to a [`LinkBorrow`].
-    /// Safety : the raw link must be one from a `Link<T>`, in a chain with only `Link<T>` and `Chain<T>` nodes.
+    /// Safety : the raw link must be one from a pinned `Link<T>`, in a chain with only `Link<T>` and `Chain<T>` nodes.
     unsafe fn new(raw_guard: RawLinkBorrow) -> Self {
         LinkBorrow {
             raw_guard,
@@ -325,11 +330,11 @@ impl<T> LinkBorrow<T> {
 
     /// Access the referenced [`Link<T>`](Link).
     /// Safe as the link cannot be destroyed (will panic) as long as the borrow exist.
-    pub fn link(&self) -> &Link<T> {
-        // SAFETY : repr(C) and RawLink first element of Link<T>
+    pub fn link(&self) -> Pin<&Link<T>> {
+        // SAFETY : repr(C) and RawLink first element of Link<T>, pinned due RawLinkBorrow.
         unsafe {
             let raw_p = self.raw_guard.link.as_ref() as *const RawLink;
-            &*(raw_p as *const Link<T>)
+            Pin::new_unchecked(&*(raw_p as *const Link<T>))
         }
     }
 }
