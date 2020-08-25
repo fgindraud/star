@@ -12,7 +12,7 @@
 //! Static references can then be derived from these _borrow guards_ : [`RawLinkBorrow`], [`LinkBorrow`].
 //!
 //! The current implementation only supports what is needed by the runtime.
-//! It could be extended to provide mutation (with a [`RefCell`](core::cell::RefCell)-like API), various iterators, ...
+//! It could be extended to provide backward iteration, ...
 //!
 //! Current usage should never have an unbounded number of references to any link.
 //! Thus the current API will panic if the reference count overflows.
@@ -139,16 +139,6 @@ impl RawLink {
             None
         }
     }
-
-    fn prev(&self) -> Option<RawLinkBorrow> {
-        if self.is_linked() {
-            // SAFETY: linked, so `prev` points to valid pinned raw_link
-            let prev = unsafe { Pin::new_unchecked(&*self.prev.get()) };
-            Some(RawLinkBorrow::new(prev))
-        } else {
-            None
-        }
-    }
 }
 
 impl Drop for RawLink {
@@ -250,12 +240,6 @@ impl<T> Link<T> {
         // SAFETY : can only be inserted in a Chain with Link<T>
         unsafe { LinkBorrow::new_or_chain(self.raw.next()?) }
     }
-
-    /// Get a dynamic borrow to the prev link in the chain.
-    pub fn prev(&self) -> Option<LinkBorrow<T>> {
-        // SAFETY : can only be inserted in a Chain with Link<T>
-        unsafe { LinkBorrow::new_or_chain(self.raw.prev()?) }
-    }
 }
 
 /// Chain head
@@ -283,11 +267,6 @@ impl<T> Chain<T> {
     /// Get the first [`Link<T>`](Link), if there is one.
     pub fn front(&self) -> Option<LinkBorrow<T>> {
         unsafe { LinkBorrow::new_or_chain(self.raw.next()?) }
-    }
-
-    /// Get the last [`Link<T>`](Link), if there is one.
-    pub fn back(&self) -> Option<LinkBorrow<T>> {
-        unsafe { LinkBorrow::new_or_chain(self.raw.prev()?) }
     }
 
     /// Iterator (forward) over the chain.
@@ -352,6 +331,12 @@ impl<T> Iterator for Iter<T> {
             self.next_link = link.link().next();
         }
         next_link
+    }
+}
+
+impl<T> Iter<T> {
+    pub fn peek(&self) -> Option<&LinkBorrow<T>> {
+        self.next_link.as_ref()
     }
 }
 

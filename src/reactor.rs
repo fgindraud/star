@@ -1,5 +1,6 @@
 use crate::intrusive_chain::{Chain, Link};
 use crate::runtime::Runtime;
+use core::cmp::max;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -261,67 +262,100 @@ impl Reactor {
         }
     }
 
+    // FIXME handle interrupts ? or in runtime loop ?
+
     /// Non-blocking check for events. Returns the number of waken [`Waker`].
     pub fn poll(self: Pin<&mut Self>) -> Result<usize, io::Error> {
-        let self_proj = self.project();
-        setup_pollfd_vec(
-            self_proj.pollfds_storage,
-            self_proj.fd_event_registrations.as_ref(),
-        );
-        if self_proj.pollfds_storage.is_empty() {
-            return Ok(0);
-        }
-        if syscall_poll(self_proj.pollfds_storage, Some(Duration::new(0, 0)))? == 0 {
-            return Ok(0);
-        }
-        let n = wake_triggered_fd_events(
-            self_proj.fd_event_registrations.as_ref(),
-            self_proj.pollfds_storage,
-        );
-        Ok(n)
+        // Call poll with timeout = 0 so that it returns immediately
+        self.call_poll_and_wake(Some(Duration::new(0, 0)))
     }
 
     /// Blocking wait for events. Returns the number of waken [`Waker`].
     pub fn wait(self: Pin<&mut Self>) -> Result<usize, io::Error> {
-        // In case of interruption, retry
-        unimplemented!()
+        let timeout =
+            self.as_ref()
+                .project_ref()
+                .time_registrations
+                .front()
+                .map(|soonest_registration| {
+                    max(
+                        soonest_registration.link().value().when - Instant::now(),
+                        Duration::new(0, 0),
+                    )
+                });
+        self.call_poll_and_wake(timeout)
+    }
+
+    fn call_poll_and_wake(
+        self: Pin<&mut Self>,
+        timeout: Option<Duration>,
+    ) -> Result<usize, io::Error> {
+        let self_proj = self.project();
+
+        let n_fd_events = {
+            let pollfds = self_proj.pollfds_storage;
+            let registrations = self_proj.fd_event_registrations;
+
+            // Setup libc::pollfd buffer
+            pollfds.clear();
+            for registration in registrations.iter() {
+                let value = registration.link().get_ref().value();
+                pollfds.push(libc::pollfd {
+                    fd: value.fd,
+                    events: value.event_type.bits(),
+                    revents: FdEventType::empty().bits(),
+                })
+            }
+
+            // Call poll() only if needed (fds, or timeout)
+            if !pollfds.is_empty() || timeout != Some(Duration::new(0, 0)) {
+                if syscall_poll(pollfds, timeout)? > 0 {
+                    // Check pollfds for triggered registrations
+                    Iterator::zip(registrations.iter(), pollfds.iter())
+                        .filter(|(_, pollfd)| {
+                            let events = FdEventType::from_bits_truncate(pollfd.events);
+                            let revents = FdEventType::from_bits_truncate(pollfd.revents);
+                            events.intersects(revents)
+                        })
+                        .map(|(registration, _)| {
+                            let registration = registration.link();
+                            registration.unlink();
+                            registration.value().waker.wake_by_ref();
+                        })
+                        .count()
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        let n_time_events = {
+            let registrations = self_proj.time_registrations.iter();
+            if registrations.peek().is_some() {
+                // Check for triggered time registrations
+                let now = Instant::now();
+                registrations
+                    .take_while(|registration| registration.link().value().when <= now)
+                    .map(|registration| {
+                        let registration = registration.link();
+                        registration.unlink();
+                        registration.value().waker.wake_by_ref();
+                    })
+                    .count()
+            } else {
+                0
+            }
+        };
+
+        Ok(n_fd_events + n_time_events)
     }
 }
 
-fn setup_pollfd_vec(
-    pollfds: &mut Vec<libc::pollfd>,
-    registrations: Pin<&Chain<FdEventRegistration>>,
-) {
-    pollfds.clear();
-    for registration in registrations.iter() {
-        let value = registration.link().get_ref().value();
-        pollfds.push(libc::pollfd {
-            fd: value.fd,
-            events: value.event_type.bits(),
-            revents: FdEventType::empty().bits(),
-        })
-    }
-}
-
-fn wake_triggered_fd_events(
-    registrations: Pin<&Chain<FdEventRegistration>>,
-    pollfds: &[libc::pollfd],
-) -> usize {
-    let mut n_waken = 0;
-    for (registration, pollfd) in Iterator::zip(registrations.iter(), pollfds.iter()) {
-        let events = FdEventType::from_bits_truncate(pollfd.events);
-        let revents = FdEventType::from_bits_truncate(pollfd.revents);
-        if events.intersects(revents) {
-            let link = registration.link();
-            link.unlink();
-            link.value().waker.wake_by_ref();
-            n_waken += 1;
-        }
-    }
-    n_waken
-}
-
-/// Safe wrapper around [`libc::ppoll()`] syscall
+/// Safe wrapper around [`libc::ppoll()`] syscall.
+///
+/// `None` timeout means infinite.
 fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<usize, io::Error> {
     let return_code = unsafe {
         libc::ppoll(
