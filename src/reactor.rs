@@ -192,7 +192,7 @@ fn wake_triggered_fd_events(
     pollfds: &[libc::pollfd],
 ) -> usize {
     let mut n_waken = 0;
-    for (registration, pollfd) in Iterator::zip(registrations.iter(), pollfds.into_iter()) {
+    for (registration, pollfd) in Iterator::zip(registrations.iter(), pollfds.iter()) {
         let events = FdEventType::from_bits_truncate(pollfd.events);
         let revents = FdEventType::from_bits_truncate(pollfd.revents);
         if events.intersects(revents) {

@@ -10,20 +10,23 @@ use std::rc::Rc;
 
 /// Task frame. Holds the future (or future's result), and metadata.
 ///
-/// This is allocated once as `Rc<PinCell<TaskFrame<TaskState<F>>>`, and two type erased handles are generated from it:
-/// - one `Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>` for runtime queues
-/// - one `Rc<PinCell<TaskFrame<dyn TaskPollJoin<F::Output>>>>` for the `JoinHandle<F::Output>`
+/// This is allocated once as `TaskFrameHandle<TaskState<F>>`, and two type erased handles are generated from it:
+/// - one `TaskFrameHandle<dyn TaskMakeProgress>` for runtime queues
+/// - one `TaskFrameHandle<dyn TaskPollJoin<F::Output>>` for the `JoinHandle<F::Output>`
 ///
 /// Metadata directly in this struct (not `state`) can be accessed from type erased handles, reducing template use.
 #[pin_project]
-struct TaskFrame<S: ?Sized> {
+struct TaskFrame<State: ?Sized> {
     /// Indicates if the task is already scheduled.
     /// This is used in [`Executor::schedule_task`] to prevent multiple references in the `ready_queue`.
     in_ready_queue: bool,
     /// [`TaskState`] or type erased versions of it: [`TaskMakeProgress`], [`TaskPollJoin`].
     #[pin]
-    state: S,
+    state: State,
 }
+
+/// Alias for task frame handles (including dyn variants).
+type TaskFrameHandle<State> = Pin<Rc<PinCell<TaskFrame<State>>>>;
 
 /// Holds the future then the future's result.
 #[pin_project(project = TaskStateProj)]
@@ -49,7 +52,7 @@ enum TaskState<F: Future> {
 
 impl<F: Future> TaskFrame<TaskState<F>> {
     /// Creates a new task on the heap
-    fn new(f: F) -> Pin<Rc<PinCell<TaskFrame<TaskState<F>>>>> {
+    fn new(f: F) -> TaskFrameHandle<TaskState<F>> {
         let task = Rc::pin(PinCell::new(TaskFrame {
             in_ready_queue: false,
             state: TaskState::Running {
@@ -137,11 +140,11 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
         // SAFETY: Implementation should be ok, except for being !Send & !Sync.
         // A warning of this has been put on the main page.
         // FIXME way to detect violations ?
-        unsafe { Waker::from_raw(Self::into_rawwaker(self_ptr)) }
+        unsafe { Waker::from_raw(Self::make_rawwaker(self_ptr)) }
     }
 
     // Conversion utils
-    unsafe fn into_rawwaker(rc: Pin<Rc<PinCell<Self>>>) -> RawWaker {
+    unsafe fn make_rawwaker(rc: Pin<Rc<PinCell<Self>>>) -> RawWaker {
         RawWaker::new(
             Rc::into_raw(Pin::into_inner_unchecked(rc)) as *const (),
             &Self::RAWWAKER_VTABLE,
@@ -162,7 +165,7 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
         Self::rawwaker_drop,
     );
     unsafe fn rawwaker_clone(ptr: *const ()) -> RawWaker {
-        Self::into_rawwaker(Self::reconstruct_cloned(ptr))
+        Self::make_rawwaker(Self::reconstruct_cloned(ptr))
     }
     unsafe fn rawwaker_wake(ptr: *const ()) {
         Executor::schedule_task(Self::reconstruct_owned(ptr))
@@ -193,7 +196,7 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
 ///     assert!(test.is_err()); // Should not have time to run
 /// }).unwrap();
 /// ```
-pub struct JoinHandle<T>(Pin<Rc<PinCell<TaskFrame<dyn TaskPollJoin<Output = T>>>>>);
+pub struct JoinHandle<T>(TaskFrameHandle<dyn TaskPollJoin<Output = T>>);
 
 impl<T> JoinHandle<T> {
     /// Internal helper, just forward to [`TaskPollJoin::poll_join`] buried deep in the struct.
@@ -223,7 +226,7 @@ impl<T> Future for JoinHandle<T> {
 /// Executor: manages the list of ready tasks.
 /// Used through the global runtime instance, hence lots of static methods.
 pub struct Executor {
-    ready_tasks: VecDeque<Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>>,
+    ready_tasks: VecDeque<TaskFrameHandle<dyn TaskMakeProgress>>,
 }
 
 impl Executor {
@@ -235,7 +238,7 @@ impl Executor {
 
     /// Schedule a task in the global runtime executor.
     /// Put the task in its `ready_queue` if it is not already there.
-    fn schedule_task(task: Pin<Rc<PinCell<TaskFrame<dyn TaskMakeProgress>>>>) {
+    fn schedule_task(task: TaskFrameHandle<dyn TaskMakeProgress>) {
         let already_in_ready_queue = {
             let mut task_borrow = task.as_ref().borrow_mut();
             let in_ready_queue = task_borrow.as_mut().project().in_ready_queue;
@@ -252,8 +255,8 @@ impl Executor {
     /// Returns false if there was no task to run.
     pub fn run_next_ready_task() -> bool {
         match Runtime::with_global_mut(|rt| rt.project().executor.ready_tasks.pop_front()) {
-            Some(task) => {
-                let mut task_borrow = task.as_ref().borrow_mut();
+            Some(task_handle) => {
+                let mut task_borrow = task_handle.as_ref().borrow_mut();
                 let task_frame = task_borrow.as_mut().project();
                 *task_frame.in_ready_queue = false;
                 task_frame.state.make_progress();
@@ -272,7 +275,7 @@ impl Executor {
 /// ```
 pub fn spawn<F: Future + 'static>(future: F) -> JoinHandle<F::Output> {
     // TODO optim with boxed future if too large ?
-    let task = TaskFrame::new(future);
-    Executor::schedule_task(task.clone());
-    JoinHandle(task)
+    let task_handle = TaskFrame::new(future);
+    Executor::schedule_task(task_handle.clone());
+    JoinHandle(task_handle)
 }
