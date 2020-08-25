@@ -49,12 +49,7 @@ mod reactor;
 /// Overall Runtime
 mod runtime;
 
-// TODO reactor
-// TODO timer (with cfg flag)
-// TODO file IO (with cfg flag)
-
 // Main API entry points
 pub use executor::{spawn, JoinHandle};
+pub use reactor::{FdEventType, WaitFdEvent, WaitTime};
 pub use runtime::block_on;
-
-pub use reactor::{FdEventType, WaitFdEvent};

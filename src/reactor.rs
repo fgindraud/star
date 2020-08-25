@@ -94,6 +94,7 @@ impl Future for WaitFdEvent {
         match state.as_mut().project() {
             Init { fd, event_type } => {
                 let (fd, event_type) = (*fd, *event_type);
+                // Register and wait
                 state.set(WaitFdEventState::Registered {
                     registration: Link::new(FdEventRegistration {
                         fd,
@@ -102,15 +103,15 @@ impl Future for WaitFdEvent {
                     }),
                 });
                 match state.project() {
-                    Init { .. } => unreachable!(),
                     Registered { registration } => Runtime::with_global_mut(move |rt| {
                         rt.project()
                             .reactor
                             .project()
                             .registered_fd_events
                             .as_ref()
-                            .push_back(registration.as_ref())
+                            .push_prev(registration.as_ref())
                     }),
+                    _ => unreachable!(),
                 }
                 Poll::Pending
             }
@@ -126,12 +127,108 @@ impl Future for WaitFdEvent {
     }
 }
 
+/// Future which waits for a specific time.
+/// ```
+/// use star::WaitTime;
+/// use std::time::Duration;
+/// let fut = async {
+///     println!("do things");
+///     WaitTime::duration(Duration::from_secs(10)).await;
+///     println!("do things later");
+/// };
+/// ```
+#[pin_project]
+pub struct WaitTime {
+    #[pin]
+    state: WaitTimeState,
+}
+
+struct TimeRegistration {
+    when: Instant,
+    waker: Waker,
+}
+
+#[pin_project(project = WaitTimeStateProj)]
+enum WaitTimeState {
+    Init {
+        when: Instant,
+    },
+    Registered {
+        /// The registration starts linked in the reactor chain.
+        /// When triggered and woken by the reactor, it will be unregistered (unlinked).
+        #[pin]
+        registration: Link<TimeRegistration>,
+    },
+}
+
+impl WaitTime {
+    /// Wait until this specific instant.
+    pub fn instant(instant: Instant) -> WaitTime {
+        WaitTime {
+            state: WaitTimeState::Init { when: instant },
+        }
+    }
+
+    /// Wait for the given duration, starting now.
+    pub fn duration(duration: Duration) -> WaitTime {
+        WaitTime::instant(Instant::now() + duration)
+    }
+}
+
+impl Future for WaitTime {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<()> {
+        use WaitTimeStateProj::*;
+        let mut state = self.project().state;
+        match state.as_mut().project() {
+            Init { when } => {
+                let when = *when;
+                if Instant::now() >= when {
+                    Poll::Ready(())
+                } else {
+                    // Register and wait
+                    state.set(WaitTimeState::Registered {
+                        registration: Link::new(TimeRegistration {
+                            when,
+                            waker: context.waker().clone(),
+                        }),
+                    });
+                    match state.project() {
+                        Registered { registration } => Runtime::with_global_mut(|rt| {
+                            let time_events = rt.project().reactor.project().registered_time_events;
+                            // FIXME insert sorted by Instant
+                            time_events.as_ref().push_prev(registration.as_ref())
+                        }),
+                        _ => unreachable!(),
+                    }
+                    Poll::Pending
+                }
+            }
+            Registered { registration } => {
+                if !registration.is_linked() {
+                    // Deregistered and woken by the reactor, no need to check time
+                    Poll::Ready(())
+                } else if Instant::now() >= registration.value().when {
+                    // Not yet woken by the reactor, deregister
+                    registration.unlink();
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
 /// _Reacts_ to specific events and wake tasks registered on them.
 #[pin_project]
 pub struct Reactor {
     /// List of registered events not already triggered.
     #[pin]
     registered_fd_events: Chain<FdEventRegistration>,
+    /// List of time events not already triggered, sorted by increasing [`Instant`] values.
+    #[pin]
+    registered_time_events: Chain<TimeRegistration>,
     /// Array used by [`syscall_poll`].
     /// Placed here so it can be reused between calls, reducing allocations.
     fd_event_storage: Vec<libc::pollfd>,
@@ -141,6 +238,7 @@ impl Reactor {
     pub fn new() -> Reactor {
         Reactor {
             registered_fd_events: Chain::new(),
+            registered_time_events: Chain::new(),
             fd_event_storage: Vec::new(),
         }
     }

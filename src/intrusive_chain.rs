@@ -269,18 +269,18 @@ impl<T> Chain<T> {
     }
 
     /// Insert the `link` to the back of the chain. Unlinks it beforehand.
-    pub fn push_back(self: Pin<&Self>, link: Pin<&Link<T>>) {
+    pub fn push_prev(self: Pin<&Self>, link: Pin<&Link<T>>) {
         self.project_ref().raw.insert_prev(link.project_ref().raw)
     }
 
     /// Borrow the first [`Link<T>`](Link), if there is one.
-    pub fn borrow_front(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
+    pub fn borrow_next(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
         let raw_guard = RawLinkBorrow::new(self.project_ref().raw).next()?;
         unsafe { LinkBorrow::new_or_chain(raw_guard) }
     }
 
     /// Borrow the last [`Link<T>`](Link), if there is one.
-    pub fn borrow_back(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
+    pub fn borrow_prev(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
         let raw_guard = RawLinkBorrow::new(self.project_ref().raw).prev()?;
         unsafe { LinkBorrow::new_or_chain(raw_guard) }
     }
@@ -288,7 +288,7 @@ impl<T> Chain<T> {
     /// Iterator (forward) over the chain.
     pub fn iter(self: Pin<&Self>) -> Iter<T> {
         Iter {
-            next_link: self.borrow_front(),
+            next_link: self.borrow_next(),
         }
     }
 }
@@ -394,10 +394,10 @@ fn test_borrow_indirect_panic() {
     let chain = Box::pin(Chain::new());
     let link0 = Box::pin(Link::new(0));
     let link1 = Box::pin(Link::new(1));
-    chain.as_ref().push_back(link0.as_ref());
-    chain.as_ref().push_back(link1.as_ref());
+    chain.as_ref().push_prev(link0.as_ref());
+    chain.as_ref().push_prev(link1.as_ref());
 
-    let _link0_borrow = chain.as_ref().borrow_front().unwrap();
+    let _link0_borrow = chain.as_ref().borrow_next().unwrap();
     drop(link0)
 }
 
@@ -406,10 +406,10 @@ fn test_chain() {
     let chain = Box::pin(Chain::new());
     let link0 = Box::pin(Link::new(0));
     let link1 = Box::pin(Link::new(1));
-    chain.as_ref().push_back(link0.as_ref());
-    chain.as_ref().push_back(link1.as_ref());
+    chain.as_ref().push_prev(link0.as_ref());
+    chain.as_ref().push_prev(link1.as_ref());
 
-    let link1_borrow = chain.as_ref().borrow_front().unwrap().next().unwrap();
+    let link1_borrow = chain.as_ref().borrow_next().unwrap().next().unwrap();
     assert_eq!(link1_borrow.link().value(), &1);
 
     let values: Vec<i32> = chain.as_ref().iter().map(|b| *b.link().value()).collect();
