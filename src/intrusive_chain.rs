@@ -5,12 +5,14 @@
 //! An example is [`Drop::drop`] which gets `&mut` access, and could happen at any time.
 //!
 //! Thus the strategy is for each link to act like an [`Rc`](std::rc::Rc).
-//! A reference counter tracks how many references exist to the link.
-//! The [`Drop`] implementation will panic if the link was referenced.
-//! Operations alsmost never return _naked_ references ; those who do return a _borrow guard_ ([`RawLinkBorrow`], [`LinkBorrow`]) to ensure the reference count is accurate.
+//! A reference counter tracks how many _dynamic references_ exist to the link.
+//! The [`Drop`] implementation will panic if the link was dynamically referenced.
+//! When possible, operations will return normal _static_ references to the link, statically preventing its destruction.
+//! Operations that move accross the chain (next, prev) will create dynamic references instead.
+//! Static references can then be derived from these _borrow guards_ : [`RawLinkBorrow`], [`LinkBorrow`].
 //!
 //! The current implementation only supports what is needed by the runtime.
-//! It could be extended to provide mutation (with a [`RefCell`](core::cell::RefCell)-like API), iterators, ...
+//! It could be extended to provide mutation (with a [`RefCell`](core::cell::RefCell)-like API), various iterators, ...
 //!
 //! Current usage should never have an unbounded number of references to any link.
 //! Thus the current API will panic if the reference count overflows.
@@ -24,6 +26,7 @@ use std::thread;
 
 /// Basic link that can **safely** form a doubly-linked circular chain with other pinned instances.
 /// Conceptually, this struct owns the _participation in a chain_.
+/// Implements the dynamic reference count with associated guard [`RawLinkBorrow`].
 ///
 /// A link starts unlinked (`self.prev == self.next == null`).
 /// **After being pinned** it can be placed _in a chain_ (maybe singleton with only self).
@@ -37,8 +40,8 @@ struct RawLink {
     prev: Cell<*const RawLink>,
     /// `Pin<&RawLink>` if not null.
     next: Cell<*const RawLink>,
-    /// Number of references to the link.
-    references: Cell<i32>,
+    /// Number of dynamic references to `self`.
+    dynamic_references: Cell<u32>,
     link_type: RawLinkType,
     _pin: PhantomPinned,
 }
@@ -54,7 +57,7 @@ impl RawLink {
         RawLink {
             prev: Cell::new(core::ptr::null()),
             next: Cell::new(core::ptr::null()),
-            references: Cell::new(0),
+            dynamic_references: Cell::new(0),
             link_type,
             _pin: PhantomPinned,
         }
@@ -65,10 +68,16 @@ impl RawLink {
     }
 
     fn increment_ref_count(&self) {
-        self.references.set(self.references.get().wrapping_add(1))
+        self.dynamic_references.set(
+            self.dynamic_references
+                .get()
+                .checked_add(1)
+                .expect("RawLink reference count overflowed"),
+        )
     }
     fn decrement_ref_count(&self) {
-        self.references.set(self.references.get().wrapping_sub(1))
+        self.dynamic_references
+            .set(self.dynamic_references.get().wrapping_sub(1))
     }
 
     /// If self is linked:
@@ -120,25 +129,41 @@ impl RawLink {
             other.next.set(self_ptr)
         }
     }
+
+    fn next(&self) -> Option<RawLinkBorrow> {
+        if self.is_linked() {
+            // SAFETY: linked, so `next` points to valid pinned raw_link
+            let next = unsafe { Pin::new_unchecked(&*self.next.get()) };
+            Some(RawLinkBorrow::new(next))
+        } else {
+            None
+        }
+    }
+
+    fn prev(&self) -> Option<RawLinkBorrow> {
+        if self.is_linked() {
+            // SAFETY: linked, so `prev` points to valid pinned raw_link
+            let prev = unsafe { Pin::new_unchecked(&*self.prev.get()) };
+            Some(RawLinkBorrow::new(prev))
+        } else {
+            None
+        }
+    }
 }
 
-/// Disconnect from any chain on destruction
-/// Part of SAFETY ; being in a chain => pinned => destructor will run before repurposing memory.
-/// Thus pointers to self in neighbouring links are valid (removed before memory is repurposed).
-///
-/// Panics if the link is referenced.
 impl Drop for RawLink {
     fn drop(&mut self) {
+        // Disconnect from any chain on destruction.
+        // Part of SAFETY ; being in a chain => pinned => destructor will run before repurposing memory.
+        // Thus pointers to self in neighbouring links are valid (removed before memory is repurposed).
         self.unlink();
-        // Panic if the link is referenced.
-        if self.references.get() > 0 {
+        if self.dynamic_references.get() > 0 {
             panic!("Drop on referenced RawLink")
         }
     }
 }
 
-/// Borrow guard for a [`RawLink`].
-/// Holds a `+1` value in the reference count sum.
+/// Dynamic Borrow guard for a [`RawLink`].
 ///
 /// This guard has no lifetime linking it to the `RawLink`.
 /// But it guarantees that the `RawLink` exists as long as the guard exists, due to:
@@ -151,40 +176,13 @@ struct RawLinkBorrow {
 impl RawLinkBorrow {
     fn new(link: Pin<&RawLink>) -> Self {
         let link = link.get_ref();
-        let ref_count = link.references.get();
-        if ref_count >= 0 {
-            link.increment_ref_count();
-            RawLinkBorrow { link: link.into() }
-        } else {
-            panic!("RawLink reference count overflowed")
-        }
+        link.increment_ref_count();
+        RawLinkBorrow { link: link.into() }
     }
 
     fn link(&self) -> Pin<&RawLink> {
-        // SAFETY : link is alive due to reference count preventing, and pinned due to new().
+        // SAFETY : link is alive due to reference count preventing destruction, and pinned due to new().
         unsafe { Pin::new_unchecked(self.link.as_ref()) }
-    }
-
-    fn next(&self) -> Option<Self> {
-        let link = self.link();
-        if link.is_linked() {
-            // SAFETY: linked, so `next` points to valid pinned raw_link
-            let next = unsafe { Pin::new_unchecked(&*link.next.get()) };
-            Some(RawLinkBorrow::new(next))
-        } else {
-            None
-        }
-    }
-
-    fn prev(&self) -> Option<Self> {
-        let link = self.link();
-        if link.is_linked() {
-            // SAFETY: linked, so `prev` points to valid pinned raw_link
-            let prev = unsafe { Pin::new_unchecked(&*link.prev.get()) };
-            Some(RawLinkBorrow::new(prev))
-        } else {
-            None
-        }
     }
 }
 
@@ -228,8 +226,6 @@ impl<T> Link<T> {
         }
     }
 
-    /// Access link value.
-    /// SAFETY : the borrow on self prevents destruction, either statically, or through a [`LinkBorrow`] which will panic on drop.
     pub fn value(&self) -> &T {
         &self.value
     }
@@ -244,10 +240,16 @@ impl<T> Link<T> {
         self.raw.unlink()
     }
 
-    /// Borrow the link (and its value) ; allows
-    pub fn borrow(self: Pin<&Self>) -> LinkBorrow<T> {
-        let raw_guard = RawLinkBorrow::new(self.project_ref().raw);
-        unsafe { LinkBorrow::new(raw_guard) }
+    /// Get a dynamic borrow to the next link in the chain.
+    pub fn next(&self) -> Option<LinkBorrow<T>> {
+        // SAFETY : can only be inserted in a Chain with Link<T>
+        unsafe { LinkBorrow::new_or_chain(self.raw.next()?) }
+    }
+
+    /// Get a dynamic borrow to the prev link in the chain.
+    pub fn prev(&self) -> Option<LinkBorrow<T>> {
+        // SAFETY : can only be inserted in a Chain with Link<T>
+        unsafe { LinkBorrow::new_or_chain(self.raw.prev()?) }
     }
 }
 
@@ -269,32 +271,30 @@ impl<T> Chain<T> {
     }
 
     /// Insert the `link` to the back of the chain. Unlinks it beforehand.
-    pub fn push_prev(self: Pin<&Self>, link: Pin<&Link<T>>) {
+    pub fn push_back(self: Pin<&Self>, link: Pin<&Link<T>>) {
         self.project_ref().raw.insert_prev(link.project_ref().raw)
     }
 
-    /// Borrow the first [`Link<T>`](Link), if there is one.
-    pub fn borrow_next(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
-        let raw_guard = RawLinkBorrow::new(self.project_ref().raw).next()?;
-        unsafe { LinkBorrow::new_or_chain(raw_guard) }
+    /// Get the first [`Link<T>`](Link), if there is one.
+    pub fn front(&self) -> Option<LinkBorrow<T>> {
+        unsafe { LinkBorrow::new_or_chain(self.raw.next()?) }
     }
 
-    /// Borrow the last [`Link<T>`](Link), if there is one.
-    pub fn borrow_prev(self: Pin<&Self>) -> Option<LinkBorrow<T>> {
-        let raw_guard = RawLinkBorrow::new(self.project_ref().raw).prev()?;
-        unsafe { LinkBorrow::new_or_chain(raw_guard) }
+    /// Get the last [`Link<T>`](Link), if there is one.
+    pub fn back(&self) -> Option<LinkBorrow<T>> {
+        unsafe { LinkBorrow::new_or_chain(self.raw.prev()?) }
     }
 
     /// Iterator (forward) over the chain.
-    pub fn iter(self: Pin<&Self>) -> Iter<T> {
+    pub fn iter(&self) -> Iter<T> {
         Iter {
-            next_link: self.borrow_next(),
+            next_link: self.front(),
         }
     }
 }
 
-/// Represents a borrow of a [`Link`].
-/// Will generate a panic if the referenced link is dropped.
+/// Dyanmic borrow of a [`Link`].
+/// Will generate a panic if the dynamically referenced link is dropped.
 ///
 /// If a panic occurs, this borrow will **not** remove itself from the reference count (required by safety).
 /// This makes the Link **poisoned**, in a sense that it will panic on destruction.
@@ -332,13 +332,6 @@ impl<T> LinkBorrow<T> {
             &*(raw_p as *const Link<T>)
         }
     }
-
-    pub fn next(&self) -> Option<LinkBorrow<T>> {
-        unsafe { LinkBorrow::new_or_chain(self.raw_guard.next()?) }
-    }
-    pub fn prev(&self) -> Option<LinkBorrow<T>> {
-        unsafe { LinkBorrow::new_or_chain(self.raw_guard.prev()?) }
-    }
 }
 
 /// Iterator over a chain
@@ -351,7 +344,7 @@ impl<T> Iterator for Iter<T> {
     fn next(&mut self) -> Option<LinkBorrow<T>> {
         let next_link = self.next_link.take();
         if let Some(link) = &next_link {
-            self.next_link = link.next();
+            self.next_link = link.link().next();
         }
         next_link
     }
@@ -383,8 +376,8 @@ fn test_raw() {
 #[test]
 #[should_panic]
 fn test_borrow_direct_panic() {
-    let link = Box::pin(Link::new(0));
-    let _borrow = link.as_ref().borrow();
+    let link = Box::pin(RawLink::new(RawLinkType::Link));
+    let _borrow = RawLinkBorrow::new(link.as_ref());
     drop(link)
 }
 
@@ -394,10 +387,10 @@ fn test_borrow_indirect_panic() {
     let chain = Box::pin(Chain::new());
     let link0 = Box::pin(Link::new(0));
     let link1 = Box::pin(Link::new(1));
-    chain.as_ref().push_prev(link0.as_ref());
-    chain.as_ref().push_prev(link1.as_ref());
+    chain.as_ref().push_back(link0.as_ref());
+    chain.as_ref().push_back(link1.as_ref());
 
-    let _link0_borrow = chain.as_ref().borrow_next().unwrap();
+    let _link0_borrow = chain.front().unwrap();
     drop(link0)
 }
 
@@ -406,10 +399,10 @@ fn test_chain() {
     let chain = Box::pin(Chain::new());
     let link0 = Box::pin(Link::new(0));
     let link1 = Box::pin(Link::new(1));
-    chain.as_ref().push_prev(link0.as_ref());
-    chain.as_ref().push_prev(link1.as_ref());
+    chain.as_ref().push_back(link0.as_ref());
+    chain.as_ref().push_back(link1.as_ref());
 
-    let link1_borrow = chain.as_ref().borrow_next().unwrap().next().unwrap();
+    let link1_borrow = chain.front().unwrap().link().next().unwrap();
     assert_eq!(link1_borrow.link().value(), &1);
 
     let values: Vec<i32> = chain.as_ref().iter().map(|b| *b.link().value()).collect();

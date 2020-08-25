@@ -109,7 +109,7 @@ impl Future for WaitFdEvent {
                             .project()
                             .registered_fd_events
                             .as_ref()
-                            .push_prev(registration.as_ref())
+                            .push_back(registration.as_ref())
                     }),
                     _ => unreachable!(),
                 }
@@ -197,7 +197,7 @@ impl Future for WaitTime {
                         Registered { registration } => Runtime::with_global_mut(|rt| {
                             let time_events = rt.project().reactor.project().registered_time_events;
                             // FIXME insert sorted by Instant
-                            time_events.as_ref().push_prev(registration.as_ref())
+                            time_events.as_ref().push_back(registration.as_ref())
                         }),
                         _ => unreachable!(),
                     }
