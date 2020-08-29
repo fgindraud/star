@@ -18,7 +18,7 @@
 //! extract a `Waker` from one of the future `poll` calls and transplant it in a future in the other runtime.
 //! Solution for now : do not do that !
 //!
-//! # Examples #
+//! # Executor #
 //!
 //! [`block_on()`] takes an [`std::future::Future`], creates a runtime, and runs the future to completion:
 //! ```
@@ -36,6 +36,22 @@
 //! let value = star::block_on(f).expect("sys error");
 //! assert_eq!(value, 42);
 //! ```
+//!
+//! # Reactor #
+//!
+//! Event management is provided through two future types : [`WaitFdEvent`] and [`WaitTime`].
+//! These have the minimum required functionnality : they complete when the event they represent has occurred.
+//!
+//! ```
+//! use std::time::{Duration, Instant};
+//! let wake_time = Instant::now() + Duration::from_millis(100);
+//! star::block_on(star::WaitTime::instant(wake_time)).expect("sys error");
+//! assert!(Instant::now() >= wake_time);
+//! ```
+//!
+//! Async-io functions can be created by checking for `EWOULDBLOCK` and requesting a wait.
+//!
+//! These futures use an intrusive list design that requires no specific allocation for them.
 
 mod intrusive_chain;
 mod utils;

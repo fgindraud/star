@@ -247,14 +247,14 @@ impl Executor {
             already_in_ready_queue
         };
         if !already_in_ready_queue {
-            Runtime::with_global_mut(move |rt| rt.project().executor.ready_tasks.push_back(task))
+            Runtime::with_global_executor(move |executor| executor.ready_tasks.push_back(task))
         }
     }
 
     /// Runs the next task in the global runtime executor.
     /// Returns false if there was no task to run.
     pub fn run_next_ready_task() -> bool {
-        match Runtime::with_global_mut(|rt| rt.project().executor.ready_tasks.pop_front()) {
+        match Runtime::with_global_executor(|executor| executor.ready_tasks.pop_front()) {
             Some(task_handle) => {
                 let mut task_borrow = task_handle.as_ref().borrow_mut();
                 let task_frame = task_borrow.as_mut().project();

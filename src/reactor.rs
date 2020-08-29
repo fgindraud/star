@@ -54,7 +54,6 @@ bitflags::bitflags!(
 /// ```
 #[pin_project]
 pub struct WaitFdEvent {
-    /// Hidden enum state
     #[pin]
     state: WaitFdEventState,
 }
@@ -104,9 +103,8 @@ impl Future for WaitFdEvent {
                     }),
                 });
                 match state.project() {
-                    Registered { registration } => Runtime::with_global_mut(move |rt| {
-                        rt.project()
-                            .reactor
+                    Registered { registration } => Runtime::with_global_reactor(move |reactor| {
+                        reactor
                             .project()
                             .fd_event_registrations
                             .as_ref()
@@ -195,8 +193,8 @@ impl Future for WaitTime {
                         }),
                     });
                     match state.project() {
-                        Registered { registration } => Runtime::with_global_mut(|rt| {
-                            let registrations = rt.project().reactor.project().time_registrations;
+                        Registered { registration } => Runtime::with_global_reactor(|reactor| {
+                            let registrations = reactor.project().time_registrations;
                             insert_sorted_by_key(
                                 registrations.as_ref(),
                                 registration.as_ref(),

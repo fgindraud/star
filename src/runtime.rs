@@ -1,27 +1,27 @@
 use crate::executor::{spawn, Executor};
 use crate::reactor::Reactor;
 use crate::utils::make_noop_waker;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::pin::Pin;
-use pin_project::pin_project;
 use std::io;
 use std::task::{Context, Poll};
 
 /// Main runtime structure.
 /// It is stored as an implicit thread_local, so it is only used through static methods.
-#[pin_project]
 pub struct Runtime {
-    pub executor: Executor,
-    #[pin]
-    pub reactor: Reactor,
+    enabled: Cell<bool>,
+    executor: RefCell<Executor>,
+    /// Reactor needs pinning which is not guaranteed by thread_local, so box it.
+    reactor: RefCell<Pin<Box<Reactor>>>,
 }
 
 impl Runtime {
     fn new() -> Self {
         Runtime {
-            executor: Executor::new(),
-            reactor: Reactor::new(),
+            enabled: Cell::new(false),
+            executor: RefCell::new(Executor::new()),
+            reactor: RefCell::new(Box::pin(Reactor::new())),
         }
     }
 
@@ -29,44 +29,63 @@ impl Runtime {
         /// Use a thread local instance for simplicity of access to the runtime.
         /// This avoid having to store Rc<Runtime> in task futures.
         /// This limits to one Runtime per thread, but only one can run a time anyway due to block_on.
-        /// Runtime is only started (Some) during [`block_on()`].
-        static RUNTIME: RefCell<Option<Pin<Box<Runtime>>>> = RefCell::new(None);
+        static RUNTIME: Runtime = Runtime::new();
     );
 
-    /// Creates (enables) the thread_local runtime instance, run f, then destroy the runtime.
-    /// Not unwind safe.
+    /// Enables the thread_local runtime instance only during f.
     fn with_global_enabled<F, R>(f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        Self::RUNTIME.with(
-            |ref_cell| match ref_cell.replace(Some(Box::pin(Runtime::new()))) {
-                None => (),
-                Some(_) => panic!("global runtime already enabled"),
-            },
-        );
-        let r = f();
-        Self::RUNTIME.with(|ref_cell| match ref_cell.replace(None) {
-            None => panic!("global runtime already disabled"),
-            Some(_) => (),
-        });
-        r
+        Self::RUNTIME.with(|rt| {
+            if rt.enabled.get() {
+                panic!("global runtime already enabled")
+            }
+            rt.enabled.set(true);
+
+            let r = f();
+
+            if !rt.enabled.get() {
+                panic!("global runtime already disabled")
+            }
+            // Cleanup leftover tasks and registrations
+            rt.executor.replace(Executor::new());
+            rt.reactor.borrow_mut().set(Reactor::new());
+            rt.enabled.set(false);
+
+            r
+        })
     }
 
-    /// Runs `f` with mutable access to the global runtime instance.
-    /// Panics if runtime is disabled or already being accessed (nested call).
-    pub fn with_global_mut<F, R>(f: F) -> R
+    /// Runs `f` with mutable access to the global executor.
+    pub fn with_global_executor<F, R>(f: F) -> R
     where
-        F: FnOnce(Pin<&mut Runtime>) -> R,
+        F: FnOnce(&mut Executor) -> R,
     {
-        Self::RUNTIME.with(move |ref_cell| {
-            let mut borrow = ref_cell
+        Self::RUNTIME.with(move |rt| {
+            if !rt.enabled.get() {
+                panic!("Runtime is disabled")
+            }
+            f(&mut rt
+                .executor
                 .try_borrow_mut()
-                .expect("nested call to with_global_runtime_mut");
-            let runtime = borrow
-                .as_mut()
-                .expect("global runtime used outside of block_on");
-            f(runtime.as_mut())
+                .expect("Nested with_global_executor"))
+        })
+    }
+
+    /// Runs 'f' with mutable access to the global reactor
+    pub fn with_global_reactor<F, R>(f: F) -> R
+    where
+        F: FnOnce(Pin<&mut Reactor>) -> R,
+    {
+        Self::RUNTIME.with(move |rt| {
+            if !rt.enabled.get() {
+                panic!("Runtime is disabled")
+            }
+            f(rt.reactor
+                .try_borrow_mut()
+                .expect("Nested with_global_reactor")
+                .as_mut())
         })
     }
 }
@@ -106,9 +125,9 @@ pub fn block_on<F: Future + 'static>(future: F) -> Result<F::Output, io::Error> 
 
             if more_tasks {
                 // Check for events to balance computation VS event driven tasks
-                Runtime::with_global_mut(|rt| rt.project().reactor.poll())?;
+                Runtime::with_global_reactor(|reactor| reactor.poll())?;
             } else {
-                let waken = Runtime::with_global_mut(|rt| rt.project().reactor.wait())?;
+                let waken = Runtime::with_global_reactor(|reactor| reactor.wait())?;
                 if waken == 0 {
                     // No more task to run, and no task awoke from a wait : stalled
                     break Err(io::Error::new(io::ErrorKind::Other, "Runtime has stalled"));
