@@ -67,5 +67,5 @@ mod runtime;
 
 // Main API entry points
 pub use executor::{spawn, JoinHandle};
-pub use reactor::{FdEventType, WaitFdEvent, WaitTime};
+pub use reactor::{set_nonblocking, FdEventType, WaitFdEvent, WaitTime};
 pub use runtime::block_on;

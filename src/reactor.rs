@@ -374,3 +374,20 @@ fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<u
         n => Ok(n as usize),
     }
 }
+
+/// Utility function : sets `fd` to _non blocking_ mode.
+///
+/// Non blocking mode is required for using [`WaitFdEvent`] future correctly on a file descriptor.
+pub fn set_nonblocking(fd: RawFd) -> Result<(), io::Error> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        let flags = flags | libc::O_NONBLOCK;
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
