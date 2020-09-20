@@ -146,12 +146,12 @@ impl<F: Future + 'static> TaskFrame<TaskState<F>> {
     // Conversion utils
     unsafe fn make_rawwaker(rc: Pin<Rc<PinCell<Self>>>) -> RawWaker {
         RawWaker::new(
-            Rc::into_raw(Pin::into_inner_unchecked(rc)) as *const (),
+            Rc::into_raw(Pin::into_inner_unchecked(rc)).cast::<()>(),
             &Self::RAWWAKER_VTABLE,
         )
     }
     unsafe fn reconstruct_owned(ptr: *const ()) -> Pin<Rc<PinCell<Self>>> {
-        Pin::new_unchecked(Rc::from_raw(ptr as *const PinCell<Self>))
+        Pin::new_unchecked(Rc::from_raw(ptr.cast::<PinCell<Self>>()))
     }
     unsafe fn reconstruct_cloned(ptr: *const ()) -> Pin<Rc<PinCell<Self>>> {
         let referenced = ManuallyDrop::new(Self::reconstruct_owned(ptr));

@@ -312,8 +312,8 @@ impl<T> LinkBorrow<T> {
     pub fn link(&self) -> Pin<&Link<T>> {
         // SAFETY : repr(C) and RawLink first element of Link<T>, pinned due RawLinkBorrow.
         unsafe {
-            let raw_p = self.raw_guard.link.as_ref() as *const RawLink;
-            Pin::new_unchecked(&*(raw_p as *const Link<T>))
+            let raw_p: *const RawLink = self.raw_guard.link.as_ref();
+            Pin::new_unchecked(&*(raw_p.cast::<Link<T>>()))
         }
     }
 }

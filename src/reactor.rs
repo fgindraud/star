@@ -2,6 +2,7 @@ use crate::intrusive_chain::{Chain, Link};
 use crate::runtime::Runtime;
 use pin_project::pin_project;
 use std::cmp::max;
+use std::convert::TryFrom;
 use std::future::Future;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -355,15 +356,17 @@ impl Reactor {
 ///
 /// `None` timeout means infinite.
 fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<usize, io::Error> {
+    let into_invalid_input = |_| io::Error::from(io::ErrorKind::InvalidInput);
+
     let return_code = unsafe {
         libc::ppoll(
             fds.as_mut_ptr(),
-            fds.len() as libc::nfds_t,
+            libc::nfds_t::try_from(fds.len()).map_err(into_invalid_input)?,
             match timeout {
                 None => std::ptr::null(),
                 Some(t) => &libc::timespec {
-                    tv_sec: t.as_secs() as libc::c_long,
-                    tv_nsec: t.subsec_nanos() as libc::c_long,
+                    tv_sec: libc::c_long::try_from(t.as_secs()).map_err(into_invalid_input)?,
+                    tv_nsec: libc::c_long::from(t.subsec_nanos()),
                 },
             },
             std::ptr::null(),
@@ -371,7 +374,7 @@ fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<u
     };
     match return_code {
         -1 => Err(io::Error::last_os_error()),
-        n => Ok(n as usize),
+        n => Ok(usize::try_from(n).unwrap()),
     }
 }
 
