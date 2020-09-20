@@ -17,11 +17,11 @@
 //! Current usage should never have an unbounded number of references to any link.
 //! Thus the current API will panic if the reference count overflows.
 
-use core::cell::Cell;
-use core::marker::{PhantomData, PhantomPinned};
-use core::pin::Pin;
-use core::ptr::NonNull;
 use pin_project::pin_project;
+use std::cell::Cell;
+use std::marker::{PhantomData, PhantomPinned};
+use std::pin::Pin;
+use std::ptr::NonNull;
 use std::thread;
 
 /// Basic link that can **safely** form a doubly-linked circular chain with other pinned instances.
@@ -55,8 +55,8 @@ impl RawLink {
     /// Create a new unlinked raw link.
     fn new(link_type: RawLinkType) -> Self {
         RawLink {
-            prev: Cell::new(core::ptr::null()),
-            next: Cell::new(core::ptr::null()),
+            prev: Cell::new(std::ptr::null()),
+            next: Cell::new(std::ptr::null()),
             dynamic_references: Cell::new(0),
             link_type,
             _pin: PhantomPinned,
@@ -99,8 +99,8 @@ impl RawLink {
                     (*n_ptr).prev.set(p_ptr);
                 }
             }
-            self.prev.set(core::ptr::null());
-            self.next.set(core::ptr::null())
+            self.prev.set(std::ptr::null());
+            self.next.set(std::ptr::null())
         }
     }
 
@@ -343,8 +343,8 @@ impl<T> Iter<T> {
 #[test]
 fn test_raw() {
     assert_eq!(
-        core::mem::size_of::<RawLink>(),
-        3 * core::mem::size_of::<*const ()>()
+        std::mem::size_of::<RawLink>(),
+        3 * std::mem::size_of::<*const ()>()
     );
     let link0 = Box::pin(RawLink::new(RawLinkType::Link));
     let link1 = Box::pin(RawLink::new(RawLinkType::Link));

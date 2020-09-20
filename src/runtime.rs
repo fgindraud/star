@@ -1,10 +1,10 @@
 use crate::executor::{spawn, Executor};
 use crate::reactor::Reactor;
 use crate::utils::make_noop_waker;
-use core::cell::{Cell, RefCell};
-use core::future::Future;
-use core::pin::Pin;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Main runtime structure.

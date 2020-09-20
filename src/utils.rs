@@ -3,7 +3,7 @@ pub use pin_cell::PinCell;
 pub use pin_weak::PinWeak;
 
 mod pin_weak {
-    use core::pin::Pin;
+    use std::pin::Pin;
     use std::rc::{Rc, Weak};
 
     /// [`Weak`] pointer to `Pin<Rc<T>>`.
@@ -30,8 +30,8 @@ mod pin_weak {
 }
 
 mod pin_cell {
-    use core::cell::{BorrowMutError, RefCell, RefMut};
-    use core::pin::Pin;
+    use std::cell::{BorrowMutError, RefCell, RefMut};
+    use std::pin::Pin;
 
     /// [`RefCell`] that propagates pinning.
     /// To be safe, it is not possible to get a `&mut T`, only `Pin<&mut T>`.
@@ -67,7 +67,7 @@ mod pin_cell {
 
     #[test]
     fn check_types() {
-        use core::marker::PhantomPinned;
+        use std::marker::PhantomPinned;
         struct NotUnpin(i32, PhantomPinned);
         let pc = Box::pin(PinCell::new(NotUnpin(42, PhantomPinned)));
         let mut borrow = pc.as_ref().borrow_mut();
@@ -77,7 +77,7 @@ mod pin_cell {
 }
 
 mod noop_waker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
+    use std::task::{RawWaker, RawWakerVTable, Waker};
 
     /// Waker that does nothing.
     /// Used for calling `poll()` outside of an await context.
@@ -86,7 +86,7 @@ mod noop_waker {
     }
 
     fn noop_rawwaker_new() -> RawWaker {
-        RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
+        RawWaker::new(std::ptr::null(), &NOOP_WAKER_VTABLE)
     }
 
     const NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(

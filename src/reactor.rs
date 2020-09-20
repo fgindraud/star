@@ -1,12 +1,12 @@
 use crate::intrusive_chain::{Chain, Link};
 use crate::runtime::Runtime;
-use core::cmp::max;
-use core::future::Future;
-use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
 use pin_project::pin_project;
+use std::cmp::max;
+use std::future::Future;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 bitflags::bitflags!(
@@ -360,13 +360,13 @@ fn syscall_poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> Result<u
             fds.as_mut_ptr(),
             fds.len() as libc::nfds_t,
             match timeout {
-                None => core::ptr::null(),
+                None => std::ptr::null(),
                 Some(t) => &libc::timespec {
                     tv_sec: t.as_secs() as libc::c_long,
                     tv_nsec: t.subsec_nanos() as libc::c_long,
                 },
             },
-            core::ptr::null(),
+            std::ptr::null(),
         )
     };
     match return_code {
