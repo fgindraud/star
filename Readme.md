@@ -5,6 +5,8 @@ This is a simple runtime for std Futures, single thread only.
 Intended usage is small workloads ; for example small desktop daemons having multiple IO sources.
 The goal is to provide an alternative to a loop with `select()` with a much nicer API and semantics.
 
+This supports only `unix` targets due to use of `poll`, `RawFd` and `libc`.
+
 ## Motivation / technical ##
 
 This has been built mainly for personnal uses and to discover the *Rust async ecosystem*, in details.
@@ -36,9 +38,6 @@ The recent `pin-project-lite` was tried, but it does not support enums nor docst
 - `PinCell<T>` : a `RefCell` like structure propagating pinning.
 - Wrapper to `poll()` syscall.
 - The internal intrusive list, which in my opinion is the least robust unsafe use.
-
-
-
 
 ## TODO ##
 
